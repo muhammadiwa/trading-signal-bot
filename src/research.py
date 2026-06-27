@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Sentiment keywords for Reddit title analysis
 BULLISH_WORDS = {"buy", "bullish", "long", "moon", "pump", "green", "breakout",
-                 "rally", "surge", "up", "gain", "ath", "all time high"}
+                 "rally", "surge", "up", "gain", "ath"}
 BEARISH_WORDS = {"sell", "bearish", "short", "dump", "red", "crash", "correction",
                  "drop", "down", "loss", "fear", "liquidat", "blood"}
 REDDIT_SUBREDDITS = ["CryptoCurrency", "bitcoin"]
@@ -62,7 +62,7 @@ def _parse_reddit_feed(rss_text: str) -> tuple[int, int, int]:
             title_el = entry.find("atom:title", ns)
             if title_el is not None and title_el.text:
                 words = set(re.findall(r'\w+', title_el.text.lower()))
-                if words & BULLISH_WORDS:
+                if words & BULLISH_WORDS or "all time high" in title_el.text.lower():
                     bullish += 1
                 elif words & BEARISH_WORDS:
                     bearish += 1
@@ -74,7 +74,7 @@ def _parse_reddit_feed(rss_text: str) -> tuple[int, int, int]:
         title_el = item.find("title")
         if title_el is not None and title_el.text:
             words = set(re.findall(r'\w+', title_el.text.lower()))
-            if words & BULLISH_WORDS:
+            if words & BULLISH_WORDS or "all time high" in title_el.text.lower():
                 bullish += 1
             elif words & BEARISH_WORDS:
                 bearish += 1
@@ -150,20 +150,29 @@ def fetch_sentiment_composite() -> dict:
         }
 
     # Build weighted sum with auto-normalization
+    # When a source fails: use neutral 0.5 for weight redistribution
     weights = {"fg": 0.4, "reddit": 0.3, "twitter": 0.3}
-    total_weight = 0.0
-    weighted_sum = 0.0
 
     if fear_greed_val is not None:
-        weighted_sum += weights["fg"] * (fear_greed_val / 100)
-        total_weight += weights["fg"]
-    if reddit_ratio is not None:
-        weighted_sum += weights["reddit"] * reddit_ratio
-        total_weight += weights["reddit"]
-    # Twitter weight redistributes automatically (not added to total)
+        fg_contrib = fear_greed_val / 100
+    else:
+        fg_contrib = 0.5  # AC1: default to neutral 50 when FG fails
 
-    composite = (weighted_sum / total_weight) * 100 if total_weight > 0 else 50.0
-    composite = round(composite, 1)
+    if reddit_ratio is not None:
+        reddit_contrib = reddit_ratio
+        reddit_weight = weights["reddit"]
+    else:
+        reddit_contrib = 0.5
+        reddit_weight = 0.0  # Exclude from active count
+
+    # Twitter always unavailable
+    twitter_weight = 0.0
+
+    composite = (
+        weights["fg"] * fg_contrib + reddit_weight * reddit_contrib
+    ) / max(weights["fg"] + reddit_weight + twitter_weight, 0.01) * 100
+
+    composite = round(max(0, min(100, composite)), 1)
 
     logger.info(
         "Sentiment: FG=%s Reddit=%s → composite=%.1f (active=%d/3)",
