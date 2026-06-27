@@ -10,7 +10,8 @@ from src.pipeline.stage_4_confidence import Signal
 logger = logging.getLogger(__name__)
 
 
-def _format_signal_block(signal: Signal, include_research: bool = False) -> str:
+def _format_signal_block(signal: Signal, include_research: bool = False,
+                          track_record: Optional[str] = None) -> str:
     """Format a single signal as a Telegram message block.
 
     Mixed language: signal fields in English, commentary in Indonesian.
@@ -25,6 +26,10 @@ def _format_signal_block(signal: Signal, include_research: bool = False) -> str:
         f"SL: {signal.stop_loss:,.2f} | TP: {signal.take_profit:,.2f}" if signal.take_profit
         else f"SL: {signal.stop_loss:,.2f} | TP: N/A",
     ]
+
+    # Track record (when available)
+    if track_record:
+        lines.append(f"📈 Track: {track_record}")
 
     # Research context (Epic 2 — populated later)
     if include_research and signal.sentiment_score is not None:

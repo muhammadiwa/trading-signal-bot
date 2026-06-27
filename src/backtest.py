@@ -78,25 +78,33 @@ def run(
             profit_factor=0.0, total_trades=0, total_return=0.0, passed=False,
         )
 
-    # Split data for walk-forward
-    split_idx = int(len(ohlcv) * train_ratio)
-    test_ohlcv = ohlcv.iloc[split_idx:].copy()
-    test_indicators = {
-        k: v.iloc[split_idx:] for k, v in indicators.items()
-    }
+    # For full backtest or insufficient data, use entire dataset
+    if train_ratio >= 1.0 or len(ohlcv) <= 50:
+        test_ohlcv = ohlcv.copy()
+        use_walk_forward = False
+    else:
+        split_idx = int(len(ohlcv) * train_ratio)
+        test_ohlcv = ohlcv.iloc[split_idx:].copy()
+        use_walk_forward = True
 
-    # Walk-forward simulation
+    # Walk-forward simulation — recompute indicators per window (no look-ahead)
+    from src.indicators import compute_all as compute_indicators
+
     trades = []
-    lookback = min(50, len(test_ohlcv) // 2)
+    lookback = min(50, max(20, len(test_ohlcv) // 4))
     entry_price = None
     entry_action = None
+    entry_sl = None
+    entry_tp = None
     holding = False
 
     for i in range(lookback, len(test_ohlcv)):
         window_ohlcv = test_ohlcv.iloc[:i + 1]
-        window_indicators = {
-            k: v.iloc[:i + 1] for k, v in test_indicators.items()
-        }
+        # Recompute indicators on window ONLY (prevents look-ahead bias)
+        try:
+            window_indicators = compute_indicators(window_ohlcv)
+        except Exception:
+            continue
 
         try:
             signal = strategy.evaluate(window_ohlcv, window_indicators)
@@ -109,36 +117,39 @@ def run(
         if not holding and signal.action != "HOLD" and signal.confidence > 0:
             entry_price = current_price
             entry_action = signal.action
+            entry_sl = signal.stop_loss  # Store ENTRY signal's SL/TP
+            entry_tp = signal.take_profit
             holding = True
 
         elif holding and i == len(test_ohlcv) - 1:
-            # Force close at end
             trades.append({
-                "action": entry_action,
-                "entry": entry_price,
-                "exit": current_price,
+                "action": entry_action, "entry": entry_price, "exit": current_price,
             })
             holding = False
 
         elif holding:
-            # Check for opposite signal or stop/target hit
             exit_signal = False
             exit_price_val = current_price
 
+            # Use ENTRY SL/TP, not current bar's signal
             if entry_action == "BUY":
-                if signal.action == "SELL" or current_price <= signal.stop_loss or \
-                   (signal.take_profit and current_price >= signal.take_profit):
+                if signal.action == "SELL":
+                    exit_signal = True
+                elif entry_sl and current_price <= entry_sl:
+                    exit_signal = True
+                elif entry_tp and current_price >= entry_tp:
                     exit_signal = True
             else:  # SELL
-                if signal.action == "BUY" or current_price >= signal.stop_loss or \
-                   (signal.take_profit and current_price <= signal.take_profit):
+                if signal.action == "BUY":
+                    exit_signal = True
+                elif entry_sl and current_price >= entry_sl:
+                    exit_signal = True
+                elif entry_tp and current_price <= entry_tp:
                     exit_signal = True
 
             if exit_signal:
                 trades.append({
-                    "action": entry_action,
-                    "entry": entry_price,
-                    "exit": exit_price_val,
+                    "action": entry_action, "entry": entry_price, "exit": exit_price_val,
                 })
                 holding = False
 

@@ -110,7 +110,7 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
     error_summary = None
 
     # Initialize DB
-    conn = get_connection()
+    conn = init_db()  # Creates tables if not exist, returns ready connection
     conn.execute(
         "INSERT INTO run_log (started_at, status) VALUES (?, ?)",
         (datetime.now(timezone.utc).isoformat(), "running"),
@@ -120,19 +120,31 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
     conn.close()
 
     try:
+        # Health check before starting
+        hc_results = health_check(config)
+        critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in hc_results.items() if not v]
+        if critical_failed:
+            logger.error("Health check FAILED — skipping pipeline: %s", ", ".join(critical_failed))
+            send_alert(f"Pipeline dibatalkan — health check gagal: {', '.join(critical_failed)}")
+            status = "aborted"
+            return {
+                "run_id": run_id, "status": status,
+                "pairs_analyzed": 0, "signals_generated": 0, "duration_seconds": 0,
+            }
+
         # Phase 0: Identity resolution — fetch top coins
         logger.info("Pipeline %s starting — fetching top %d coins", run_id, config.top_coins_limit)
-        # (Implementation deferred to Epic 2 — stub for now)
-        symbols = ["BTC-USDT", "ETH-USDT"]  # Placeholder
+        symbols = ["BTC-USDT", "ETH-USDT"]  # Placeholder (Epic 2+ will fetch real top coins)
         pairs_analyzed = len(symbols)
 
-        # Stage execution
+        # Stage execution with artifact directories
         pipeline_dir = Path("data") / "pipeline" / run_id
         pipeline_dir.mkdir(parents=True, exist_ok=True)
 
-        for stage_key, stage_name in STAGES:
+        for idx, (stage_key, stage_name) in enumerate(STAGES, 1):
             elapsed = time.monotonic() - start_time
-            if elapsed > config.runtime_budget_minutes * 55:  # 5 min warning
+            warning_threshold = (config.runtime_budget_minutes - 5) * 60
+            if elapsed > warning_threshold:
                 logger.warning("Pipeline approaching timeout — %.0f min elapsed", elapsed / 60)
 
             if elapsed > config.runtime_budget_minutes * 60:
@@ -140,13 +152,32 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                 status = "timeout"
                 break
 
+            stage_dir = pipeline_dir / f"stage_{idx}_{stage_key}"
+            stage_dir.mkdir(parents=True, exist_ok=True)
+
             try:
-                logger.info("Running %s", stage_name)
-                # (Stage implementations connected in Epic 1 completion)
-                time.sleep(0.1)  # Stub — replace with actual stage function calls
+                logger.info("Running %s (artifacts → %s)", stage_name, stage_dir)
+                # Stage implementations
+                if stage_key == "data_fetch":
+                    from src.exchange import fetch_ohlcv
+                    for sym in symbols:
+                        fetch_ohlcv(sym, force_refresh=True, max_age_hours=config.freshness_max_hours)
+                elif stage_key == "profile_match":
+                    from src.indicators import load_with_indicators
+                    from src.pipeline.stage_2_profile import find_best_strategy
+                    for sym in symbols:
+                        try:
+                            df = load_with_indicators(f"data/ohlcv/{sym}.parquet")
+                            ind = {k: df[k] for k in df.columns if k not in ("timestamp","open","high","low","close","volume")}
+                            find_best_strategy(df, ind, sym, config.min_win_rate, config.min_sharpe)
+                        except Exception:
+                            logger.warning("Profile match failed for %s", sym)
+                elif stage_key == "telegram_deliver":
+                    from src.telegram_sender import send_daily_signals
+                    send_daily_signals([], pairs_analyzed, 0.0)
             except Exception as e:
-                logger.error("%s failed: %s", stage_name, e)
-                stage_failed = STAGES.index((stage_key, stage_name)) + 1
+                logger.error("%s failed: %s", stage_name, e, exc_info=True)
+                stage_failed = idx
                 error_summary = str(e)[:200]
                 status = "failed"
                 send_alert(f"Pipeline gagal di {stage_name}: {str(e)[:100]}")
@@ -213,6 +244,7 @@ def start_scheduler():
         name="Trading Signal Pipeline",
     )
 
+    scheduler.start()
     logger.info("Scheduler started — pipeline will run daily at %02d:%02d UTC", hour, minute)
 
     # Run health check on startup
@@ -234,4 +266,5 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger.info("Trading Signal Pipeline starting...")
+    init_db()  # Ensure tables exist before pipeline runs
     run_pipeline()

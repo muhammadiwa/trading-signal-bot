@@ -174,6 +174,7 @@ def filter_signals(
         passed = passed[:max_signals]
 
     # Step 4: Cooldown filter (check DB)
+    conn = None
     try:
         from src.db import get_connection
         conn = get_connection()
@@ -191,7 +192,8 @@ def filter_signals(
                     continue
                 cooldown_passed.append(s)
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
     except Exception as e:
         logger.warning("Cooldown check failed (DB unavailable?): %s — skipping cooldown filter", e)
         cooldown_passed = passed
@@ -212,8 +214,9 @@ def save_signals(signals: list[Signal]) -> int:
         return 0
 
     from src.db import get_connection
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         for s in signals:
             conn.execute(
                 """INSERT OR REPLACE INTO signals
@@ -229,6 +232,7 @@ def save_signals(signals: list[Signal]) -> int:
         conn.commit()
         logger.info("Saved %d signals to DB", len(signals))
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     return len(signals)
