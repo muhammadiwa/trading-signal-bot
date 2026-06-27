@@ -1,8 +1,8 @@
 """SQLite database initialization and helpers."""
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime, timezone
 
 
 SCHEMA = """
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS signals (
     sentiment_score REAL,
     onchain_signal TEXT,
     macro_flag INTEGER DEFAULT 0,
-    research_metadata TEXT,       -- JSON blob
+    research_metadata TEXT,
     timestamp_utc TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'resolved'))
 );
@@ -58,6 +58,18 @@ CREATE INDEX IF NOT EXISTS idx_outcomes_signal ON outcomes(signal_id);
 CREATE INDEX IF NOT EXISTS idx_run_log_started ON run_log(started_at);
 """
 
+PRAGMAS = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+"""
+
+
+def _configure_connection(conn: sqlite3.Connection) -> None:
+    """Apply standard pragmas and row factory to a connection."""
+    conn.executescript(PRAGMAS)
+    conn.row_factory = sqlite3.Row
+
 
 def init_db(db_path: str | None = None) -> sqlite3.Connection:
     """Initialize the SQLite database with schema.
@@ -65,36 +77,56 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
     Creates the database file and all tables if they don't exist.
     Safe to call multiple times — uses IF NOT EXISTS.
 
+    Caller is responsible for closing the returned connection.
+
     Args:
         db_path: Path to SQLite file. Defaults to data/signals.db
                  relative to project root.
 
     Returns:
         sqlite3.Connection ready for use.
+
+    Raises:
+        PermissionError: If the database directory cannot be created.
     """
     if db_path is None:
         project_root = Path(__file__).resolve().parent.parent
         db_path = str(project_root / "data" / "signals.db")
 
     db_dir = Path(db_path).parent
-    db_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        db_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        raise PermissionError(f"Cannot create database directory: {db_dir}")
 
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")     # Better concurrent access
-    conn.execute("PRAGMA foreign_keys=ON")
+    _configure_connection(conn)
     conn.executescript(SCHEMA)
-    conn.commit()
-
     return conn
 
 
 def get_connection(db_path: str | None = None) -> sqlite3.Connection:
-    """Get a connection to the database. Initializes if needed."""
+    """Get a configured connection to the database.
+
+    Applies WAL journal mode, foreign keys, busy timeout, and row factory.
+    Does NOT create tables — use init_db() for schema initialization.
+
+    Caller is responsible for closing the returned connection.
+    """
     if db_path is None:
         project_root = Path(__file__).resolve().parent.parent
         db_path = str(project_root / "data" / "signals.db")
 
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
+    _configure_connection(conn)
     return conn
+
+
+@contextmanager
+def managed_connection(db_path: str | None = None):
+    """Context manager that yields a connection and auto-closes it."""
+    conn = get_connection(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()

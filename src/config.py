@@ -3,11 +3,12 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
+import re
 import yaml
 
 
 class ConfigError(Exception):
-    """Raised when required configuration is missing."""
+    """Raised when required configuration is missing or invalid."""
 
 
 @dataclass
@@ -60,6 +61,68 @@ class Settings:
     top_coins_limit: int = 100
     top_coins_exclude_stablecoins: bool = True
 
+    def __post_init__(self):
+        """Validate cross-field constraints and types."""
+        errors: list[str] = []
+
+        # Numeric range checks
+        if not isinstance(self.min_confidence, (int, float)) or not 0 < self.min_confidence <= 1:
+            errors.append(f"min_confidence must be in (0, 1], got {self.min_confidence}")
+        if not isinstance(self.parallel_workers, int) or self.parallel_workers < 1:
+            errors.append(f"parallel_workers must be int >= 1, got {self.parallel_workers}")
+        if not isinstance(self.lookback_months, int) or self.lookback_months < 1:
+            errors.append(f"lookback_months must be int >= 1, got {self.lookback_months}")
+
+        # Risk constraint checks
+        if not isinstance(self.min_size_pct, (int, float)) or self.min_size_pct < 0:
+            errors.append(f"min_size_pct must be >= 0, got {self.min_size_pct}")
+        if not isinstance(self.max_size_pct, (int, float)) or self.max_size_pct <= 0:
+            errors.append(f"max_size_pct must be > 0, got {self.max_size_pct}")
+        if self.min_size_pct > self.max_size_pct:
+            errors.append(
+                f"min_size_pct ({self.min_size_pct}) cannot exceed max_size_pct ({self.max_size_pct})"
+            )
+        if not isinstance(self.global_max_drawdown, (int, float)) or self.global_max_drawdown <= 0:
+            errors.append(f"global_max_drawdown must be > 0, got {self.global_max_drawdown}")
+
+        # LLM timeout
+        if not isinstance(self.llm_timeout_seconds, int) or self.llm_timeout_seconds < 1:
+            errors.append(f"llm_timeout_seconds must be int >= 1, got {self.llm_timeout_seconds}")
+
+        if errors:
+            raise ConfigError("\n".join(errors))
+
+
+def _load_dotenv(env_path: Path) -> dict[str, str]:
+    """Parse a .env file into a dict without mutating os.environ.
+
+    Handles: quoted values, inline comments, export keyword, empty lines.
+    """
+    result: dict[str, str] = {}
+    if not env_path.exists():
+        return result
+
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Strip 'export ' prefix
+            if line.startswith("export "):
+                line = line[7:]
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # Remove inline comments (handles: VALUE # comment)
+            value = re.sub(r"\s+#.*$", "", value)
+            # Unquote single/double quotes
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            result[key] = value
+    return result
+
 
 def load_config(config_dir: Path | None = None) -> Settings:
     """Load settings.yaml and resolve environment variables.
@@ -72,8 +135,7 @@ def load_config(config_dir: Path | None = None) -> Settings:
         Settings dataclass with all configuration values.
 
     Raises:
-        ConfigError: If settings.yaml is missing or unparseable.
-        FileNotFoundError: If .env is missing (logged as warning, not error).
+        ConfigError: If settings.yaml is missing, unparseable, or invalid.
     """
     if config_dir is None:
         config_dir = Path(__file__).resolve().parent.parent / "config"
@@ -82,8 +144,19 @@ def load_config(config_dir: Path | None = None) -> Settings:
     if not yaml_path.exists():
         raise ConfigError(f"settings.yaml not found at {yaml_path}")
 
-    with open(yaml_path) as f:
-        raw = yaml.safe_load(f)
+    try:
+        with open(yaml_path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Invalid YAML in {yaml_path}: {e}") from e
+
+    # Handle empty file (safe_load returns None)
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"settings.yaml must contain a YAML mapping, got {type(raw).__name__}"
+        )
 
     pipeline = raw.get("pipeline", {})
     signals = raw.get("signals", {})
@@ -93,15 +166,14 @@ def load_config(config_dir: Path | None = None) -> Settings:
     telegram = raw.get("telegram", {})
     top_coins = raw.get("top_coins", {})
 
-    # Load .env
+    # Load .env into a dict, then selectively inject into os.environ
     env_path = config_dir.parent / ".env"
-    if env_path.exists():
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    os.environ[key.strip()] = value.strip()
+    env_vars = _load_dotenv(env_path)
+    for k, v in env_vars.items():
+        # Only inject app-specific env vars, not system vars
+        if k in ("PATH", "HOME", "USER", "SHELL", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH"):
+            continue
+        os.environ.setdefault(k, v)
 
     return Settings(
         timeframe=pipeline.get("timeframe", "1d"),
