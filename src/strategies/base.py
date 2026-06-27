@@ -61,7 +61,7 @@ class MomentumBreakout:
         vol_ratio = indicators["volume_ratio"].iloc[-1]
         atr_14 = indicators["atr_14"].iloc[-1]
 
-        if pd.isna(high_n) or pd.isna(low_n):
+        if pd.isna(high_n) or pd.isna(low_n) or pd.isna(atr_14) or pd.isna(vol_ratio):
             return StrategySignal("HOLD", 0.0, close)
 
         if close > high_n * (1 + self.k) and vol_ratio > 1.5:
@@ -127,9 +127,11 @@ class TrendFollowing:
             return StrategySignal("HOLD", 0.0, close)
 
         atr_val = indicators["atr_14"].iloc[-1]
+        if pd.isna(atr_val):
+            return StrategySignal("HOLD", 0.0, close)
 
         if prev_short <= prev_long and curr_short > curr_long and adx > self.adx_threshold:
-            conf = min(1.0, 0.6 + (adx - self.adx_threshold) / 50)
+            conf = min(1.0, 0.4 + (adx - self.adx_threshold) / 50)
             return StrategySignal(
                 "BUY", conf, close,
                 stop_loss=close - atr_val * 1.5,
@@ -138,7 +140,7 @@ class TrendFollowing:
             )
 
         if prev_short >= prev_long and curr_short < curr_long and adx > self.adx_threshold:
-            conf = min(1.0, 0.6 + (adx - self.adx_threshold) / 50)
+            conf = min(1.0, 0.4 + (adx - self.adx_threshold) / 50)
             return StrategySignal(
                 "SELL", conf, close,
                 stop_loss=close + atr_val * 1.5,
@@ -179,7 +181,7 @@ class MeanReversion:
         adx = indicators["adx_14"].iloc[-1]
         atr_val = indicators["atr_14"].iloc[-1]
 
-        if any(pd.isna(v) for v in [rsi_val, bb_upper, bb_lower, vol_ratio, adx]):
+        if any(pd.isna(v) for v in [rsi_val, bb_upper, bb_lower, vol_ratio, adx, atr_val]):
             return StrategySignal("HOLD", 0.0, close)
 
         # Only trigger in ranging markets
@@ -233,7 +235,7 @@ class VolatilityBreakout:
             return StrategySignal("HOLD", 0.0, close)
 
         if close > sma_20 + atr_val * self.k:
-            conf = min(1.0, 0.5 + (close - sma_20) / (atr_val * 3 + 1e-10))
+            conf = min(1.0, 0.5 + (close - sma_20) / (atr_val * 6 + 1e-10))
             return StrategySignal(
                 "BUY", conf, close,
                 stop_loss=close - atr_val * 1.5,
@@ -242,7 +244,7 @@ class VolatilityBreakout:
             )
 
         if close < sma_20 - atr_val * self.k:
-            conf = min(1.0, 0.5 + (sma_20 - close) / (atr_val * 3 + 1e-10))
+            conf = min(1.0, 0.5 + (sma_20 - close) / (atr_val * 6 + 1e-10))
             return StrategySignal(
                 "SELL", conf, close,
                 stop_loss=close + atr_val * 1.5,
@@ -280,18 +282,18 @@ class VolumeDivergence:
         if pd.isna(atr_val):
             return StrategySignal("HOLD", 0.0, close)
 
-        # Find swing points: last 2 peaks for bearish, last 2 troughs for bullish
+        # Find swing points on raw close data (not rolling min/max — avoids plateaus)
         n = len(ohlcv)
         window = min(20, n - 1)
+        recent_close = ohlcv["close"].iloc[-window:]
+        recent_vol = ohlcv["volume"].iloc[-window:]
 
-        # Bullish divergence: price makes lower low, volume declines
-        recent_lows = ohlcv["close"].iloc[-window:].rolling(5).min()
+        # Bullish divergence: lower low + declining volume
         troughs = []
-        for i in range(window - 1):
+        for i in range(1, window - 1):
             idx = -window + i
-            if i > 0 and i < window - 1:
-                if recent_lows.iloc[i] < recent_lows.iloc[i - 1] and recent_lows.iloc[i] < recent_lows.iloc[i + 1]:
-                    troughs.append((close.index[idx], close.iloc[idx], vol.iloc[idx]))
+            if recent_close.iloc[i] < recent_close.iloc[i - 1] and recent_close.iloc[i] < recent_close.iloc[i + 1]:
+                troughs.append((ohlcv.index[idx], ohlcv["close"].iloc[idx], ohlcv["volume"].iloc[idx]))
 
         if len(troughs) >= 2:
             t1, t2 = troughs[-2], troughs[-1]
@@ -305,14 +307,12 @@ class VolumeDivergence:
                     metadata={"divergence": "bullish"},
                 )
 
-        # Bearish divergence: price makes higher high, volume declines
-        recent_highs = ohlcv["close"].iloc[-window:].rolling(5).max()
+        # Bearish divergence: higher high + declining volume
         peaks = []
-        for i in range(window - 1):
+        for i in range(1, window - 1):
             idx = -window + i
-            if i > 0 and i < window - 1:
-                if recent_highs.iloc[i] > recent_highs.iloc[i - 1] and recent_highs.iloc[i] > recent_highs.iloc[i + 1]:
-                    peaks.append((ohlcv.index[idx], ohlcv["close"].iloc[idx], ohlcv["volume"].iloc[idx]))
+            if recent_close.iloc[i] > recent_close.iloc[i - 1] and recent_close.iloc[i] > recent_close.iloc[i + 1]:
+                peaks.append((ohlcv.index[idx], ohlcv["close"].iloc[idx], ohlcv["volume"].iloc[idx]))
 
         if len(peaks) >= 2:
             p1, p2 = peaks[-2], peaks[-1]
