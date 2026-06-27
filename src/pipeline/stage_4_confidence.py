@@ -39,20 +39,24 @@ def compute_confidence(
     strategy_signal: StrategySignal,
     backtest_result,  # BacktestResult
     atr_14: float,
+    current_price: float,
+    trigger_price: float,
 ) -> float:
     """Compute Technical Confidence from strategy signal and backtest.
 
     Formula: 0.7 × strategy_score + 0.3 × signal_strength
     - strategy_score = win_rate × profit_factor / max_possible (normalized)
-    - signal_strength = normalized distance from trigger threshold
+    - signal_strength = 1 − |price − trigger| / (ATR × 2), clamped [0,1]
     """
     # Strategy score from backtest metrics
-    max_possible = 1.0  # Theoretical max for win_rate × profit_factor
+    max_possible = 1.0
     strategy_score = backtest_result.win_rate * backtest_result.profit_factor / max_possible
     strategy_score = min(1.0, strategy_score)
 
-    # Signal strength from strategy's own confidence
-    signal_strength = strategy_signal.confidence
+    # Signal strength: normalized distance from trigger threshold
+    # Closer to trigger = stronger signal
+    distance = abs(current_price - trigger_price)
+    signal_strength = 1.0 - min(1.0, distance / (atr_14 * 2 + 1e-10))
 
     technical_confidence = 0.7 * strategy_score + 0.3 * signal_strength
     return round(min(1.0, max(0.0, technical_confidence)), 4)
@@ -60,6 +64,7 @@ def compute_confidence(
 
 def compute_sl_tp(
     action: str,
+    symbol: str,
     entry_price: float,
     atr_14: float,
     sl_mult: float = 1.5,
@@ -70,19 +75,24 @@ def compute_sl_tp(
     BUY:  SL = entry - ATR×sl_mult, TP = entry + ATR×tp_mult
     SELL: SL = entry + ATR×sl_mult, TP = entry - ATR×tp_mult
 
-    Prices are rounded: 2dp for USD pairs, 0dp for JPY/KRW (heuristic).
+    Rounding: 2dp for USD pairs, 0dp for JPY/KRW, 4dp for small caps.
     """
     atr_val = max(atr_14, 1e-8)
 
     if action == "BUY":
         sl = entry_price - atr_val * sl_mult
         tp = entry_price + atr_val * tp_mult
-    else:  # SELL
+    elif action == "SELL":
         sl = entry_price + atr_val * sl_mult
         tp = entry_price - atr_val * tp_mult
+    else:  # HOLD
+        return entry_price, None
 
-    # Heuristic: BTC/ETH < $10K → 2dp, penny coins → more decimals
-    if entry_price > 1000:
+    # Rounding by quote currency (detected from symbol suffix)
+    upper = symbol.upper()
+    if "JPY" in upper or "KRW" in upper:
+        decimals = 0
+    elif entry_price > 1000:
         decimals = 2
     elif entry_price > 1:
         decimals = 4
@@ -103,8 +113,11 @@ def generate_signal(
     tp_mult: float = 3.0,
 ) -> Signal:
     """Generate a structured Signal from strategy output and backtest."""
-    confidence = compute_confidence(strategy_signal, backtest_result, atr_14)
-    sl, tp = compute_sl_tp(action, entry_price, atr_14, sl_mult, tp_mult)
+    confidence = compute_confidence(
+        strategy_signal, backtest_result, atr_14,
+        current_price=entry_price, trigger_price=entry_price,
+    )
+    sl, tp = compute_sl_tp(action, symbol, entry_price, atr_14, sl_mult, tp_mult)
 
     return Signal(
         id=str(uuid.uuid4()),
@@ -164,20 +177,21 @@ def filter_signals(
     try:
         from src.db import get_connection
         conn = get_connection()
-        cooldown_passed = []
-        for s in passed:
-            # Query last signal for this symbol
-            cutoff = (now - pd.Timedelta(hours=cooldown_hours)).isoformat()
-            row = conn.execute(
-                "SELECT id FROM signals WHERE symbol=? AND timestamp_utc > ? AND status='pending' LIMIT 1",
-                (s.symbol, cutoff),
-            ).fetchone()
-            if row and s.confidence < cooldown_override:
-                logger.info("%s in cooldown — last signal < %dh ago (conf=%.0f%% < %.0f%%)",
-                            s.symbol, cooldown_hours, s.confidence * 100, cooldown_override * 100)
-                continue
-            cooldown_passed.append(s)
-        conn.close()
+        try:
+            cooldown_passed = []
+            for s in passed:
+                cutoff = (now - pd.Timedelta(hours=cooldown_hours)).isoformat()
+                row = conn.execute(
+                    "SELECT id FROM signals WHERE symbol=? AND timestamp_utc > ? LIMIT 1",
+                    (s.symbol, cutoff),
+                ).fetchone()
+                if row and s.confidence < cooldown_override:
+                    logger.info("%s in cooldown — last signal < %dh ago (conf=%.0f%% < %.0f%%)",
+                                s.symbol, cooldown_hours, s.confidence * 100, cooldown_override * 100)
+                    continue
+                cooldown_passed.append(s)
+        finally:
+            conn.close()
     except Exception as e:
         logger.warning("Cooldown check failed (DB unavailable?): %s — skipping cooldown filter", e)
         cooldown_passed = passed
