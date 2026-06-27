@@ -60,8 +60,17 @@ def match_strategy(profile: PairProfile) -> list:
         if not any(type(s) is type(inst) for s in ranked):
             ranked.append(inst)
 
-    # If nothing matched (unlikely), use all
+    # If nothing matched or unclear profile, log and use all
     if not ranked:
+        logger.info("Unclear profile for %s — using ensemble (all strategies)", profile.symbol)
+        ranked = [cls() for cls in _ALL_STRATEGIES]
+    elif len(ranked) == 1 and ranked[0].name == "Volume-Price Divergence":
+        # Only weakest strategy matched → unclear, ensemble all
+        logger.info(
+            "Unclear profile for %s (trend=%.0f vol=%.0f mr=%.0f vq=%.0f) — using ensemble",
+            profile.symbol, profile.trendiness, profile.volatility,
+            profile.mean_reversion, profile.volume_quality,
+        )
         ranked = [cls() for cls in _ALL_STRATEGIES]
 
     # VolumeDivergence always last (weakest standalone)
@@ -108,7 +117,10 @@ def find_best_strategy(
     best_result = None
 
     for strategy in candidates:
-        result = run_backtest(strategy, ohlcv, indicators)
+        # Auto-enable walk-forward validation if data > 12 months (~365 bars)
+        use_walk_forward = len(ohlcv) > 365
+        train_ratio = 0.8 if use_walk_forward else 1.0
+        result = run_backtest(strategy, ohlcv, indicators, train_ratio=train_ratio)
         all_results.append(result)
 
         logger.info(

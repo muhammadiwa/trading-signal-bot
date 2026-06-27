@@ -44,6 +44,12 @@ def compute(ohlcv: pd.DataFrame, indicators: dict[str, pd.Series],
     if len(ohlcv) < window:
         window = len(ohlcv)
 
+    # Validate required indicator keys
+    required = {"adx_14", "atr_14", "rsi_14", "bb_lower", "bb_upper", "volume_ratio"}
+    missing = required - set(indicators)
+    if missing:
+        raise KeyError(f"Profile compute missing indicators: {sorted(missing)}")
+
     recent = ohlcv.iloc[-window:]
     adx = indicators["adx_14"].iloc[-window:]
     atr = indicators["atr_14"].iloc[-window:]
