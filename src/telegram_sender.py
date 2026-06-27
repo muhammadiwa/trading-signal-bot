@@ -15,13 +15,15 @@ def _format_signal_block(signal: Signal, include_research: bool = False) -> str:
 
     Mixed language: signal fields in English, commentary in Indonesian.
     """
-    emoji = "🟢" if signal.action == "BUY" else "🔴"
+    emoji_map = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
+    emoji = emoji_map.get(signal.action, "⚪")
     entry_str = f"${signal.entry_price:,.2f}" if signal.entry_price > 1 else f"${signal.entry_price:.6f}"
 
     lines = [
         f"{emoji} {signal.action} — {signal.symbol} {entry_str}",
         f"{signal.strategy} | Conf {signal.confidence*100:.0f}%",
-        f"SL: {signal.stop_loss:,.2f} | TP: {signal.take_profit:,.2f}" if signal.take_profit else f"SL: {signal.stop_loss:,.2f}",
+        f"SL: {signal.stop_loss:,.2f} | TP: {signal.take_profit:,.2f}" if signal.take_profit
+        else f"SL: {signal.stop_loss:,.2f} | TP: N/A",
     ]
 
     # Research context (Epic 2 — populated later)
@@ -106,6 +108,12 @@ def send_daily_signals(
         return False
 
     message = format_daily_message(signals, pairs_analyzed, win_rate_7d, include_research)
+
+    if len(message) > 4000:
+        # Truncate with warning
+        cutoff = message.rfind("\n", 0, 4000)
+        message = message[:cutoff] + "\n\n... dan sinyal lainnya (pesan terlalu panjang)"
+        logger.warning("Message truncated to %d chars (was %d)", len(message), len(message) + 100)
 
     # Late import — python-telegram-bot is a required dependency
     from telegram import Bot
