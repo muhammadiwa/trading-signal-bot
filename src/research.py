@@ -5,6 +5,7 @@ Auto-normalizes weights when sources are missing. Never crashes — returns neut
 """
 
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from typing import Optional
@@ -186,3 +187,137 @@ def fetch_sentiment_composite() -> dict:
         "active_sources": active,
         "composite": composite,
     }
+
+
+# ============================================================
+# Story 2.2: On-chain Data Fetcher (FR1.3)
+# ============================================================
+
+WHALE_ALERT_API_KEY = os.getenv("WHALE_ALERT_API_KEY", "")
+
+
+def fetch_whale_transactions(min_value_usd: int = 1_000_000) -> Optional[dict]:
+    """Fetch whale transactions from Whale Alert API.
+
+    Separates buy-side vs sell-side based on transaction metadata.
+
+    Args:
+        min_value_usd: Minimum transaction value in USD (default $1M per AC).
+
+    Returns:
+        dict with buy_count, sell_count, buy_volume, sell_volume.
+        Returns None if API key missing or fetch fails.
+    """
+    if not WHALE_ALERT_API_KEY:
+        logger.debug("Whale Alert API key not configured — skipping on-chain")
+        return None
+
+    try:
+        resp = requests.get(
+            "https://api.whale-alert.io/v1/transactions",
+            params={"api_key": WHALE_ALERT_API_KEY, "min_value": min_value_usd, "limit": 100},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        txs = resp.json().get("transactions", [])
+    except Exception as e:
+        logger.warning("Whale Alert fetch failed: %s", e)
+        return None
+
+    if not txs:
+        return None
+
+    buy_count = sell_count = 0
+    buy_volume = sell_volume = 0.0
+
+    for tx in txs:
+        amount = tx.get("amount_usd", 0)
+        # Heuristic: transactions TO exchanges are sells, FROM are buys
+        to_owner = (tx.get("to", {}) or {}).get("owner_type", "")
+        from_owner = (tx.get("from", {}) or {}).get("owner_type", "")
+
+        if to_owner == "exchange":
+            sell_count += 1
+            sell_volume += amount
+        elif from_owner == "exchange":
+            buy_count += 1
+            buy_volume += amount
+        else:
+            # Unknown direction: classify by transaction type if available
+            tx_type = (tx.get("transaction_type", "") or "").lower()
+            if "sell" in tx_type:
+                sell_count += 1
+                sell_volume += amount
+            elif "buy" in tx_type:
+                buy_count += 1
+                buy_volume += amount
+            # else: unclassified, skip
+
+    return {
+        "buy_count": buy_count, "sell_count": sell_count,
+        "buy_volume": buy_volume, "sell_volume": sell_volume,
+        "total_count": buy_count + sell_count,
+    }
+
+
+def fetch_coingecko_trending() -> Optional[list[str]]:
+    """Fetch trending coins from CoinGecko (free, no API key)."""
+    try:
+        resp = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=10)
+        resp.raise_for_status()
+        coins = resp.json().get("coins", [])
+        return [c["item"]["symbol"].upper() for c in coins[:10]]
+    except Exception as e:
+        logger.warning("CoinGecko trending fetch failed: %s", e)
+    return None
+
+
+def compute_onchain(whale_data: Optional[dict],
+                    trending: Optional[list[str]],
+                    symbol: str = "") -> tuple[str, float]:
+    """Compute composite on-chain signal.
+
+    Classification (deterministic):
+      1. Whale buy/sell ratio: buy_count / (buy_count + sell_count)
+         > 0.6 → bullish, < 0.4 → bearish, else neutral
+      2. CoinGecko trending: if symbol in trending → bullish
+      3. Combined: strongest signal wins (bullish > neutral > bearish)
+
+    Args:
+        whale_data: Output from fetch_whale_transactions().
+        trending: List of trending symbols from CoinGecko.
+        symbol: Trading pair symbol.
+
+    Returns:
+        (onchain_signal: str, multiplier: float)
+        Signal is "bullish", "neutral", or "bearish".
+        Multiplier: 1.15 bullish, 1.0 neutral, 0.85 bearish per FR3.2.
+    """
+    base = symbol.split("-")[0].upper() if symbol else ""
+    signals = []
+
+    # Whale ratio signal
+    if whale_data and whale_data.get("total_count", 0) > 0:
+        buy = whale_data["buy_count"]
+        sell = whale_data["sell_count"]
+        total = buy + sell
+        if total > 0:
+            ratio = buy / total
+            if ratio > 0.6:
+                signals.append("bullish")
+            elif ratio < 0.4:
+                signals.append("bearish")
+            else:
+                signals.append("neutral")
+
+    # Trending signal
+    if trending and base in trending:
+        signals.append("bullish")
+
+    # Deterministic classification: strongest signal wins
+    if "bullish" in signals:
+        return "bullish", 1.15
+    elif "bearish" in signals:
+        return "bearish", 0.85
+    else:
+        return "neutral", 1.0
