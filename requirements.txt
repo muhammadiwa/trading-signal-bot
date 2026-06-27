@@ -1,0 +1,7 @@
+ccxt>=4.0.0
+pandas>=2.0.0
+pyarrow>=15.0.0
+python-telegram-bot>=20.0
+apscheduler>=3.10.0
+requests>=2.31.0
+pyyaml>=6.0

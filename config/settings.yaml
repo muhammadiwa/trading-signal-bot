@@ -1,0 +1,76 @@
+# settings.yaml — watchlist, thresholds, API endpoints
+# Edit this file to configure the pipeline. No API keys here.
+
+pipeline:
+  timeframe: "1d"              # OHLCV timeframe
+  lookback_months: 6           # Minimum historical data
+  freshness_max_hours: 4       # Data stale threshold
+  parallel_workers: 10         # Max parallel processing
+  runtime_budget_minutes: 60   # Pipeline timeout
+  cron_time_utc: "23:00"       # Daily trigger time
+
+signals:
+  min_confidence: 0.60         # Signal filter threshold
+  max_signals_per_day: 30      # Output cap
+  cooldown_hours: 24           # Same-pair cooldown
+  cooldown_override_confidence: 0.80  # High-conf bypass
+
+strategies:
+  momentum:
+    enabled: true
+    weight: 0.25
+    params: {n: 20, k: 0.005}
+  trend_following:
+    enabled: true
+    weight: 0.25
+    params: {short: 20, long: 50, adx_threshold: 25}
+  mean_reversion:
+    enabled: true
+    weight: 0.20
+    params: {rsi_length: 14, bb_length: 20}
+  volatility_breakout:
+    enabled: true
+    weight: 0.15
+    params: {atr_length: 14, k: 1.5}
+  volume_divergence:
+    enabled: true
+    weight: 0.15
+
+research:
+  sentiment:
+    fear_greed_url: "https://api.alternative.me/fng/"
+    reddit_enabled: true
+  on_chain:
+    whale_alert_enabled: true
+  macro:
+    calendar_path: "config/macro_calendar.json"
+  prediction_markets:
+    polymarket_enabled: true
+    polymarket_tag: "crypto"
+
+backtest:
+  min_win_rate: 0.40
+  min_sharpe: 0.5
+  walk_forward_enabled: false      # Enable when data > 12 months
+
+risk:
+  atr_sl_multiplier: 1.5
+  atr_tp_multiplier: 3.0
+  max_size_pct: 0.10
+  min_size_pct: 0.01
+  global_max_drawdown: 0.25
+
+llm:
+  provider: "tokenrouter"
+  model: "deepseek/deepseek-v4-pro"
+  timeout_seconds: 3
+  max_tokens: 150
+
+telegram:
+  message_format: "mixed"      # "en" | "id" | "mixed"
+  retry_attempts: 3
+
+top_coins:
+  source: "coingecko"
+  limit: 100
+  exclude_stablecoins: true
