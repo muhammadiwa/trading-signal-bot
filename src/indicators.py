@@ -3,8 +3,15 @@
 No pandas-ta dependency needed (Python 3.14 compatibility, pandas-ta unavailable).
 """
 
-import pandas as pd
+import logging
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+logger = logging.getLogger(__name__)
 
 
 def rsi(close: pd.Series, length: int = 14) -> pd.Series:
@@ -97,12 +104,7 @@ def compute_all(ohlcv: pd.DataFrame) -> dict[str, pd.Series]:
     Raises:
         ValueError: If required columns are missing or DataFrame is empty.
     """
-    if len(ohlcv) == 0:
-        raise ValueError("OHLCV DataFrame is empty")
-
-    missing = _REQUIRED_COLUMNS - set(ohlcv.columns)
-    if missing:
-        raise ValueError(f"OHLCV DataFrame missing columns: {sorted(missing)}")
+    _validate_ohlcv(ohlcv)
 
     close = ohlcv["close"]
     high = ohlcv["high"]
@@ -131,13 +133,61 @@ def compute_all(ohlcv: pd.DataFrame) -> dict[str, pd.Series]:
         "volume_ratio": volume / sma(volume, 20).replace(0, np.nan),
     }
 
-    # Warn if data insufficient for long-lookback indicators
+    _warn_insufficient_data(ohlcv)
+    return result
+
+
+def _validate_ohlcv(ohlcv: pd.DataFrame) -> None:
+    """Validate OHLCV DataFrame has required columns and is non-empty."""
+    if len(ohlcv) == 0:
+        raise ValueError("OHLCV DataFrame is empty")
+    missing = _REQUIRED_COLUMNS - set(ohlcv.columns)
+    if missing:
+        raise ValueError(f"OHLCV DataFrame missing columns: {sorted(missing)}")
+
+
+def _warn_insufficient_data(ohlcv: pd.DataFrame) -> None:
+    """Warn if data is insufficient for long-lookback indicators."""
     if len(ohlcv) < 200:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Only %d rows available; indicators requiring 50+ lookback (ma_50, ma_200) "
-            "will have NaN values at the start of the series.",
+        logger.warning(
+            "Only %d rows available; indicators requiring 50+ lookback "
+            "(ma_50, ma_200) will have NaN values at the start of the series.",
             len(ohlcv),
         )
 
-    return result
+
+def save_with_indicators(ohlcv: pd.DataFrame, path: str | Path) -> Path:
+    """Compute indicators and save OHLCV + indicators to a single Parquet file.
+
+    Args:
+        ohlcv: DataFrame with columns: open, high, low, close, volume.
+        path: Output Parquet file path.
+
+    Returns:
+        Path to the saved file.
+    """
+    _validate_ohlcv(ohlcv)
+    indicators = compute_all(ohlcv)
+
+    # Merge indicators into OHLCV DataFrame
+    df = ohlcv.copy()
+    for key, series in indicators.items():
+        df[key] = series
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, path)
+    return path
+
+
+def load_with_indicators(path: str | Path) -> pd.DataFrame:
+    """Load OHLCV + indicators from a Parquet file.
+
+    Args:
+        path: Path to Parquet file.
+
+    Returns:
+        DataFrame with OHLCV columns and 14 indicator columns.
+    """
+    return pq.read_table(Path(path)).to_pandas()
