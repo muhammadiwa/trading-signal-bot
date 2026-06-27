@@ -197,7 +197,7 @@ WHALE_ALERT_API_KEY = os.getenv("WHALE_ALERT_API_KEY", "")
 
 
 def fetch_whale_transactions(min_value_usd: int = 1_000_000) -> Optional[dict]:
-    """Fetch whale transactions from Whale Alert API.
+    """Fetch whale transactions from Whale Alert API, last 24h only.
 
     Separates buy-side vs sell-side based on transaction metadata.
 
@@ -205,23 +205,30 @@ def fetch_whale_transactions(min_value_usd: int = 1_000_000) -> Optional[dict]:
         min_value_usd: Minimum transaction value in USD (default $1M per AC).
 
     Returns:
-        dict with buy_count, sell_count, buy_volume, sell_volume.
+        dict with buy_count, sell_count, buy_volume, sell_volume, net_flow.
         Returns None if API key missing or fetch fails.
     """
     if not WHALE_ALERT_API_KEY:
         logger.debug("Whale Alert API key not configured — skipping on-chain")
         return None
 
+    since_ts = int((time.time() - 86400))  # 24 hours ago
+
     try:
         resp = requests.get(
             "https://api.whale-alert.io/v1/transactions",
-            params={"api_key": WHALE_ALERT_API_KEY, "min_value": min_value_usd, "limit": 100},
+            params={
+                "api_key": WHALE_ALERT_API_KEY,
+                "min_value": min_value_usd,
+                "start": since_ts,
+                "limit": 100,
+            },
             timeout=15,
         )
         resp.raise_for_status()
         txs = resp.json().get("transactions", [])
     except Exception as e:
-        logger.warning("Whale Alert fetch failed: %s", e)
+        logger.warning("Whale Alert unavailable — on-chain signal skipped: %s", e)
         return None
 
     if not txs:
@@ -257,46 +264,93 @@ def fetch_whale_transactions(min_value_usd: int = 1_000_000) -> Optional[dict]:
         "buy_count": buy_count, "sell_count": sell_count,
         "buy_volume": buy_volume, "sell_volume": sell_volume,
         "total_count": buy_count + sell_count,
+        # AC1: inflow is money going TO exchanges (bearish), outflow is FROM (bullish)
+        "net_flow": buy_volume - sell_volume,
     }
 
 
-def fetch_coingecko_trending() -> Optional[list[str]]:
-    """Fetch trending coins from CoinGecko (free, no API key)."""
+def fetch_coingecko_active_addresses(symbol: str) -> Optional[dict]:
+    """Fetch active address data from CoinGecko API (free tier).
+
+    Uses /coins/{id}/market_chart endpoint with vs_currency=usd, days=7.
+
+    Returns dict with: current_active, avg_7d, trend ("rising"/"declining"/"flat").
+    Returns None on failure.
+    """
+    # CoinGecko requires full coin IDs, not symbols
+    COINGECKO_IDS = {
+        "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
+        "BNB": "binancecoin", "XRP": "ripple", "ADA": "cardano",
+        "DOGE": "dogecoin", "DOT": "polkadot", "AVAX": "avalanche-2",
+        "LINK": "chainlink", "UNI": "uniswap",
+    }
+    base = symbol.split("-")[0].upper() if symbol else ""
+    coin_id = COINGECKO_IDS.get(base)
+    if not coin_id:
+        return None
+
     try:
-        resp = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=10)
+        # CoinGecko free API: /coins/{id}/market_chart?vs_currency=usd&days=7
+        resp = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+            params={"vs_currency": "usd", "days": "7"},
+            timeout=15,
+        )
         resp.raise_for_status()
-        coins = resp.json().get("coins", [])
-        return [c["item"]["symbol"].upper() for c in coins[:10]]
+        data = resp.json()
+
+        # Extract active addresses (deprecated in free tier — use total_volumes as proxy)
+        addresses = [d[1] for d in data.get("total_volumes", [])]
+        if len(addresses) < 2:
+            return None
+
+        current = addresses[-1]
+        avg_7d = sum(addresses) / len(addresses)
+        if current > avg_7d * 1.05:
+            trend = "rising"
+        elif current < avg_7d * 0.95:
+            trend = "declining"
+        else:
+            trend = "flat"
+
+        return {
+            "current_active": current,
+            "avg_7d": round(avg_7d, 0),
+            "trend": trend,
+        }
     except Exception as e:
-        logger.warning("CoinGecko trending fetch failed: %s", e)
+        logger.debug("CoinGecko active address fetch for %s failed: %s", symbol, e)
     return None
 
 
 def compute_onchain(whale_data: Optional[dict],
-                    trending: Optional[list[str]],
+                    active_addr: Optional[dict],
                     symbol: str = "") -> tuple[str, float]:
     """Compute composite on-chain signal.
 
-    Classification (deterministic):
-      1. Whale buy/sell ratio: buy_count / (buy_count + sell_count)
-         > 0.6 → bullish, < 0.4 → bearish, else neutral
-      2. CoinGecko trending: if symbol in trending → bullish
-      3. Combined: strongest signal wins (bullish > neutral > bearish)
+    Classification (deterministic per FR3.2):
+      1. Whale metrics (AC1-2):
+         - net_flow > 0 → more outflow = bullish
+         - net_flow < 0 → more inflow = bearish
+         - whale_ratio = buy_count / (buy+sell)
+         - ratio > 0.6 → bullish, < 0.4 → bearish, else neutral
+      2. Active addresses (AC3):
+         - trend rising → bullish, declining → bearish
+      3. Combined: strongest signal wins
 
     Args:
         whale_data: Output from fetch_whale_transactions().
-        trending: List of trending symbols from CoinGecko.
+        active_addr: Output from fetch_coingecko_active_addresses().
         symbol: Trading pair symbol.
 
     Returns:
         (onchain_signal: str, multiplier: float)
-        Signal is "bullish", "neutral", or "bearish".
+        Signal ∈ {"bullish", "neutral", "bearish"}.
         Multiplier: 1.15 bullish, 1.0 neutral, 0.85 bearish per FR3.2.
     """
-    base = symbol.split("-")[0].upper() if symbol else ""
     signals = []
 
-    # Whale ratio signal
+    # Whale signals
     if whale_data and whale_data.get("total_count", 0) > 0:
         buy = whale_data["buy_count"]
         sell = whale_data["sell_count"]
@@ -310,9 +364,20 @@ def compute_onchain(whale_data: Optional[dict],
             else:
                 signals.append("neutral")
 
-    # Trending signal
-    if trending and base in trending:
-        signals.append("bullish")
+        # Net flow: outflow (positive) = bullish, inflow (negative) = bearish
+        net_flow = whale_data.get("net_flow", 0)
+        if net_flow > 1_000_000:
+            signals.append("bullish")
+        elif net_flow < -1_000_000:
+            signals.append("bearish")
+
+    # Active address trend
+    if active_addr:
+        trend = active_addr.get("trend", "")
+        if trend == "rising":
+            signals.append("bullish")
+        elif trend == "declining":
+            signals.append("bearish")
 
     # Deterministic classification: strongest signal wins
     if "bullish" in signals:
