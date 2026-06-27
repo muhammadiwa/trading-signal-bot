@@ -2,11 +2,13 @@
 
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
+import ccxt
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -18,23 +20,25 @@ _EXCHANGE_IDS = ["binance", "okx"]
 _MAX_RETRIES = 3
 _RETRY_DELAY_SECONDS = 2  # Base delay; exponential backoff: delay * 2^attempt
 
-# Required OHLCV columns
-_REQUIRED_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+# Per-symbol file locks for thread-safe cache writes
+_cache_locks: dict[str, threading.Lock] = {}
+_cache_locks_lock = threading.Lock()
 
 
 def _normalize_symbol(symbol: str) -> str:
-    """Normalize symbol to CCXT format (e.g., BTC-USDT → BTC/USDT)."""
-    return symbol.replace("-", "/")
+    """Normalize symbol to CCXT format (e.g., BTC-USDT → BTC/USDT).
 
-
-def _denormalize_symbol(symbol: str) -> str:
-    """Convert CCXT format back to our format (e.g., BTC/USDT → BTC-USDT)."""
-    return symbol.replace("/", "-")
-
-
-def _ms_timestamp_to_datetime(ms: int) -> datetime:
-    """Convert millisecond timestamp to UTC datetime."""
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    Handles edge cases: lowercase input, perpetual swaps, already-normalized.
+    """
+    s = symbol.upper()
+    if "/" in s:
+        return s  # Already normalized
+    # For perpetuals: BTC-USDT-PERP → BTC/USDT:USDT
+    parts = s.rsplit("-", 1)
+    if len(parts) == 2 and parts[1] in ("PERP", "PERPETUAL", "SWAP"):
+        base_quote = parts[0].replace("-", "/")
+        return f"{base_quote}:{parts[1]}"
+    return s.replace("-", "/")
 
 
 def _ohlcv_cache_path(symbol: str) -> Path:
@@ -75,38 +79,43 @@ def _load_cache(symbol: str) -> Optional[pd.DataFrame]:
 
 
 def _save_cache(symbol: str, df: pd.DataFrame) -> None:
-    """Save OHLCV data to Parquet cache atomically.
+    """Save OHLCV data to Parquet cache atomically, thread-safe.
 
     Writes to a temp file first, then renames to avoid partial writes.
     Appends to existing cache if present (drops duplicate timestamps).
+    Uses per-symbol file lock to prevent write-write races.
     """
     cache_path = _ohlcv_cache_path(symbol)
 
-    # Load existing cache and merge
-    existing = _load_cache(symbol)
-    if existing is not None and not existing.empty:
-        df = pd.concat([existing, df], ignore_index=True)
-        # Drop duplicate timestamps
-        if "timestamp" in df.columns:
-            before = len(df)
-            df = df.drop_duplicates(subset=["timestamp"], keep="last")
-            dropped = before - len(df)
-            if dropped > 0:
-                logger.debug("Dropped %d duplicate timestamps for %s", dropped, symbol)
-        # Sort by timestamp
-        df = df.sort_values("timestamp").reset_index(drop=True)
+    # Per-symbol lock for thread safety
+    with _cache_locks_lock:
+        if symbol not in _cache_locks:
+            _cache_locks[symbol] = threading.Lock()
+        lock = _cache_locks[symbol]
 
-    # Atomic write: temp file → rename
-    temp_path = cache_path.with_suffix(".parquet.tmp")
-    try:
-        table = pa.Table.from_pandas(df)
-        pq.write_table(table, temp_path)
-        os.replace(temp_path, cache_path)
-    except Exception:
-        # Clean up temp file on failure
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise
+    with lock:
+        # Load existing cache and merge
+        existing = _load_cache(symbol)
+        if existing is not None and not existing.empty:
+            df = pd.concat([existing, df], ignore_index=True)
+            if "timestamp" in df.columns:
+                before = len(df)
+                df = df.drop_duplicates(subset=["timestamp"], keep="last")
+                dropped = before - len(df)
+                if dropped > 0:
+                    logger.debug("Dropped %d duplicate timestamps for %s", dropped, symbol)
+            df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # Atomic write: temp file → rename
+        temp_path = cache_path.with_suffix(".parquet.tmp")
+        try:
+            table = pa.Table.from_pandas(df)
+            pq.write_table(table, temp_path)
+            os.replace(temp_path, cache_path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            raise
 
 
 def _fetch_from_exchange(exchange_id: str, symbol: str, since_ms: int,
@@ -125,19 +134,58 @@ def _fetch_from_exchange(exchange_id: str, symbol: str, since_ms: int,
     Raises:
         Various CCXT exceptions on failure.
     """
-    import ccxt
+    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+    try:
+        normalized = _normalize_symbol(symbol)
+        ohlcv = exchange.fetch_ohlcv(normalized, timeframe, since=since_ms, limit=1000)
+        if not ohlcv:
+            raise ValueError(f"{exchange_id} returned empty OHLCV for {normalized}")
 
-    exchange_class = getattr(ccxt, exchange_id)
-    exchange = exchange_class({"enableRateLimit": True})
-    normalized = _normalize_symbol(symbol)
+        df = pd.DataFrame(
+            ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df
+    finally:
+        if hasattr(exchange, "close"):
+            exchange.close()
 
-    ohlcv = exchange.fetch_ohlcv(normalized, timeframe, since=since_ms, limit=1000)
-    if not ohlcv:
-        raise ValueError(f"{exchange_id} returned empty OHLCV for {normalized}")
 
-    df = pd.DataFrame(
-        ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
+def _fetch_from_coingecko(symbol: str, since_ms: int, timeframe: str = "1d") -> pd.DataFrame:
+    """Fetch OHLCV from CoinGecko public API as final fallback.
+
+    CoinGecko uses crypto IDs (e.g., 'bitcoin'), not CCXT symbols.
+    This is a best-effort fallback — may not support all pairs.
+    """
+    import requests
+
+    # Map common symbols to CoinGecko IDs
+    COINGECKO_IDS = {
+        "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
+        "BNB": "binancecoin", "XRP": "ripple", "ADA": "cardano",
+        "DOGE": "dogecoin", "DOT": "polkadot", "AVAX": "avalanche-2",
+        "MATIC": "matic-network", "LINK": "chainlink", "UNI": "uniswap",
+    }
+
+    base = symbol.split("-")[0].upper()
+    coin_id = COINGECKO_IDS.get(base)
+    if not coin_id:
+        raise ValueError(f"CoinGecko: no ID mapping for {symbol}")
+
+    days = max(1, int((time.time() * 1000 - since_ms) / 86400000))
+    days = min(days, 365)  # CoinGecko free tier limit
+
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": str(days)}
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data:
+        raise ValueError(f"CoinGecko returned empty OHLCV for {coin_id}")
+
+    df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
+    df["volume"] = 0.0  # CoinGecko OHLC doesn't include volume
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df
 
@@ -210,17 +258,38 @@ def fetch_ohlcv(
 
         logger.warning("%s exhausted after %d attempts for %s", exchange_id, _MAX_RETRIES, symbol)
 
-    # All exchanges failed — try stale cache
+    # All exchanges failed — try CoinGecko as final fallback per AD-4
+    try:
+        logger.info("Falling back to CoinGecko for %s", symbol)
+        df = _fetch_from_coingecko(symbol, since_ms, timeframe)
+        _save_cache(symbol, df)
+        if len(df) < 180:
+            logger.warning(
+                "Insufficient history for %s: %d rows (minimum 6 months recommended)",
+                symbol, len(df),
+            )
+        return df
+    except Exception as cg_error:
+        logger.warning("CoinGecko fallback for %s failed: %s", symbol, cg_error)
+
+    # All sources failed — try stale cache
     cached = _load_cache(symbol)
     if cached is not None and not cached.empty:
+        cache_age_hours = "unknown"
+        try:
+            if cache_path.exists():
+                age_seconds = time.time() - cache_path.stat().st_mtime
+                cache_age_hours = f"{age_seconds / 3600:.1f}h"
+        except OSError:
+            pass
         logger.warning(
-            "All exchanges failed for %s — using stale cache (age: unknown). "
-            "Last error: %s", symbol, last_error,
+            "All sources failed for %s — using stale cache (age: %s). Last error: %s",
+            symbol, cache_age_hours, last_error,
         )
         return cached
 
     raise RuntimeError(
-        f"All exchanges failed for {symbol} and no cache available. "
+        f"All sources failed for {symbol} and no cache available. "
         f"Last error: {last_error}"
     )
 
