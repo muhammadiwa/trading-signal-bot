@@ -10,7 +10,7 @@ pipeline:
   cron_time_utc: "23:00"       # Daily trigger time
 
 signals:
-  min_confidence: 0.60         # Signal filter threshold
+  min_confidence: 0.70         # Signal filter threshold
   max_signals_per_day: 30      # Output cap
   cooldown_hours: 24           # Same-pair cooldown
   cooldown_override_confidence: 0.80  # High-conf bypass

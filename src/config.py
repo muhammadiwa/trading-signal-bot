@@ -24,7 +24,7 @@ class Settings:
     cron_time_utc: str = "23:00"
 
     # Signals
-    min_confidence: float = 0.60
+    min_confidence: float = 0.70
     max_signals_per_day: int = 30
     cooldown_hours: int = 24
     cooldown_override_confidence: float = 0.80
