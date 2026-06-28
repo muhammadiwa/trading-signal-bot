@@ -172,6 +172,40 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                             find_best_strategy(df, ind, sym, config.min_win_rate, config.min_sharpe)
                         except Exception:
                             logger.warning("Profile match failed for %s", sym)
+                elif stage_key == "research_context":
+                    from src.research import (
+                        fetch_sentiment_composite, fetch_whale_transactions,
+                        fetch_coingecko_active_addresses, compute_onchain,
+                        macro_flag_for_date,
+                    )
+                    from src.research_scoring import (
+                        compute_research_multiplier, apply_research_to_confidence,
+                    )
+                    sentiment = fetch_sentiment_composite()
+                    whale = fetch_whale_transactions()
+                    for sym in symbols:
+                        active_addr = fetch_coingecko_active_addresses(sym)
+                        onchain_signal, _ = compute_onchain(whale, active_addr, sym)
+                        has_macro, macro_pen, macro_warning = macro_flag_for_date()
+                        multiplier = compute_research_multiplier(
+                            sentiment_score=sentiment.get("composite"),
+                            onchain_signal=onchain_signal,
+                            macro_has_event=has_macro,
+                            macro_penalty=macro_pen,
+                        )
+                        # Store for downstream stages
+                        research_results[sym] = {
+                            "sentiment_score": sentiment.get("composite"),
+                            "onchain_signal": onchain_signal,
+                            "macro_flag": has_macro,
+                            "macro_penalty": macro_pen,
+                            "multiplier": multiplier,
+                        }
+                        logger.info(
+                            "Research %s: sentiment=%.0f onchain=%s macro=%s → multiplier=%.2f",
+                            sym, sentiment.get("composite", 50), onchain_signal,
+                            "yes" if has_macro else "no", multiplier,
+                        )
                 elif stage_key == "telegram_deliver":
                     from src.telegram_sender import send_daily_signals
                     send_daily_signals([], pairs_analyzed, 0.0)
