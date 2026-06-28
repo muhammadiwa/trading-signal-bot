@@ -1,8 +1,11 @@
 """SQLite database initialization and helpers."""
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -148,3 +151,42 @@ def managed_connection(db_path: str | None = None):
         yield conn
     finally:
         conn.close()
+
+
+def ensure_column(table: str, column: str, col_def: str,
+                  db_path: str | None = None) -> bool:
+    """Add a column to an existing table if it doesn't already exist.
+
+    Idempotent — safe to call multiple times.
+
+    Args:
+        table: Table name.
+        column: Column name.
+        col_def: Column definition (e.g., 'REAL').
+        db_path: Optional explicit DB path.
+
+    Returns True if column was added.
+    """
+    conn = get_connection(db_path)
+    try:
+        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column in cols:
+            return False
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+        conn.commit()
+        logger.info("Migration: added %s.%s (%s)", table, column, col_def)
+        return True
+    finally:
+        conn.close()
+
+
+def run_migrations(db_path: str | None = None) -> list[str]:
+    """Run all pending schema migrations. Idempotent. Returns list of changes."""
+    added = []
+    if ensure_column("run_log", "win_rate_7d", "REAL", db_path):
+        added.append("run_log.win_rate_7d")
+    if ensure_column("signals", "timeframe", "TEXT NOT NULL DEFAULT '1d'", db_path):
+        added.append("signals.timeframe")
+    if added:
+        logger.info("Migrations applied: %s", ", ".join(added))
+    return added
