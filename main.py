@@ -532,4 +532,7 @@ if __name__ == "__main__":
     )
     logger.info("Trading Signal Pipeline starting...")
     init_db().close()
+    # Run schema migrations for backward compatibility (retro AI #2, #4)
+    from src.db import run_migrations
+    run_migrations()
     run_pipeline()

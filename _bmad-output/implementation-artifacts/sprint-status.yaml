@@ -93,8 +93,8 @@ action_items:
   - epic: 3
     action: "Tambahkan DB migration helper — function ensure_column/ensure_table yang idempoten"
     owner: "Kumaha-sia"
-    status: open
+    status: done
   - epic: 3
     action: "Integration test untuk full pipeline end-to-end"
     owner: "Kumaha-sia"
-    status: open
+    status: done
