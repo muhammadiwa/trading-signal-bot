@@ -1,0 +1,100 @@
+# generated: 2026-06-28
+# last_updated: 2026-06-28
+# project: sinyal-trading
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+
+generated: 2026-06-28
+last_updated: 2026-06-28
+project: sinyal-trading
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  # Epic 1: Daily Signal Pipeline
+  epic-1: done
+  1-1-project-setup: done
+  1-2-ohlcv-data-fetcher: done
+  1-3-indicator-engine: done
+  1-4-strategy-library: done
+  1-5-profile-strategy-matching: done
+  1-6-signal-generation-filter: done
+  1-7-telegram-delivery: done
+  1-8-pipeline-orchestrator: done
+  epic-1-retrospective: done
+
+  # Epic 2: Research Context Integration
+  epic-2: done
+  2-1-sentiment-data-fetcher: done
+  2-2-on-chain-data-fetcher: done
+  2-3-macro-calendar-overlay: done
+  2-4-prediction-markets-fetcher: done
+  2-5-research-multiplier-engine: done
+  2-6-signal-enhancement-research: done
+  epic-2-retrospective: done
+
+  # Epic 3: Self-Improving Accuracy
+  epic-3: done
+  3-1-outcome-tracker: done
+  3-2-llm-reflection: done
+  3-3-adaptive-weights: done
+  epic-3-retrospective: done
+
+action_items:
+  - epic: 1
+    action: "Selalu uji pipeline end-to-end sebelum merge — minimal smoke test"
+    owner: "Kumaha-sia"
+    status: open
+  - epic: 1
+    action: "Schema changes harus ALTER TABLE untuk backward compat"
+    owner: "Kumaha-sia"
+    status: open
+  - epic: 2
+    action: "Dokumentasikan data source limitation — CoinGecko proxy, Reddit tanpa 24h filter"
+    owner: "Kumaha-sia"
+    status: open
+  - epic: 3
+    action: "Tambahkan DB migration helper — function ensure_column/ensure_table yang idempoten"
+    owner: "Kumaha-sia"
+    status: open
+  - epic: 3
+    action: "Integration test untuk full pipeline end-to-end"
+    owner: "Kumaha-sia"
+    status: open
