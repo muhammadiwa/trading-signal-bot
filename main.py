@@ -545,7 +545,10 @@ if __name__ == "__main__":
     )
     # Load .env first so all modules have access to env vars
     from src.config import _load_dotenv
-    _load_dotenv(Path(__file__).resolve().parent / ".env")
+    env_vars = _load_dotenv(Path(__file__).resolve().parent / ".env")
+    for k, v in env_vars.items():
+        if k not in ("PATH", "HOME", "USER", "SHELL"):
+            os.environ.setdefault(k, v)
 
     logger.info("Trading Signal Pipeline starting...")
     init_db().close()
