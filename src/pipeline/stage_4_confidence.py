@@ -1,5 +1,6 @@
 """Signal generation, filtering, and persistence."""
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -11,6 +12,25 @@ import pandas as pd
 from src.strategies.base import StrategySignal
 
 logger = logging.getLogger(__name__)
+
+# Correlation pairs — high-correlation assets where clustered signals are noise
+_CORRELATED_PAIRS: list[tuple[str, str]] = [
+    ("BTC", "WBTC"),  # Wrapped BTC = same asset
+    ("ETH", "stETH"),  # Lido staked ETH = same asset
+]
+
+
+def _are_correlated(sym_a: str, sym_b: str) -> bool:
+    """Check if two symbols are correlated (same underlying asset)."""
+    base_a = sym_a.split("-")[0].upper()
+    base_b = sym_b.split("-")[0].upper()
+    for a, b in _CORRELATED_PAIRS:
+        a_u, b_u = a.upper(), b.upper()
+        if base_a == a_u and base_b == b_u:
+            return True
+        if base_a == b_u and base_b == a_u:
+            return True
+    return False
 
 
 @dataclass
@@ -25,6 +45,7 @@ class Signal:
     stop_loss: float
     take_profit: Optional[float] = None
     strategy: str = ""
+    timeframe: str = "1d"  # "1h" | "4h" | "1d"
     timestamp_utc: str = ""
     status: str = "pending"
 
@@ -48,13 +69,10 @@ def compute_confidence(
     - strategy_score = win_rate × profit_factor / max_possible (normalized)
     - signal_strength = 1 − |price − trigger| / (ATR × 2), clamped [0,1]
     """
-    # Strategy score from backtest metrics
     max_possible = 1.0
     strategy_score = backtest_result.win_rate * backtest_result.profit_factor / max_possible
     strategy_score = min(1.0, strategy_score)
 
-    # Signal strength: normalized distance from trigger threshold
-    # Closer to trigger = stronger signal
     distance = abs(current_price - trigger_price)
     signal_strength = 1.0 - min(1.0, distance / (atr_14 * 2 + 1e-10))
 
@@ -67,6 +85,7 @@ def compute_sl_tp(
     symbol: str,
     entry_price: float,
     atr_14: float,
+    atr_50: float = 0.0,
     sl_mult: float = 1.5,
     tp_mult: float = 3.0,
 ) -> tuple[float, Optional[float]]:
@@ -75,26 +94,33 @@ def compute_sl_tp(
     BUY:  SL = entry - ATR×sl_mult, TP = entry + ATR×tp_mult
     SELL: SL = entry + ATR×sl_mult, TP = entry - ATR×tp_mult
 
-    SL/TP are clamped to a minimum of 0.01 to prevent negative/invalid prices.
-    Rounding: 0dp for JPY/KRW pairs, 2dp for large-cap (>1000), 4dp mid, 6dp small.
+    Adaptive SL: if ATR(14) < 0.5 × ATR(50), widen SL to 2× ATR(14)×sl_mult
+    (prevents tight stops during low-volatility regime — from brainstorm Sabotase #4).
+
+    SL/TP clamped to minimum 0.01. Rounding per currency.
     """
     atr_val = max(atr_14, 1e-8)
 
+    # Adaptive SL: widen when current-atr < 50% of longer-term atr
+    effective_sl_mult = sl_mult
+    if atr_50 > 1e-8 and atr_14 < 0.5 * atr_50:
+        effective_sl_mult = sl_mult * 2.0  # Double SL width in low-vol regime
+        logger.debug("Adaptive SL: atr14=%.2f < 0.5×atr50=%.2f → SL mult %.1f→%.1f",
+                     atr_14, atr_50, sl_mult, effective_sl_mult)
+
     if action == "BUY":
-        sl = entry_price - atr_val * sl_mult
+        sl = entry_price - atr_val * effective_sl_mult
         tp = entry_price + atr_val * tp_mult
     elif action == "SELL":
-        sl = entry_price + atr_val * sl_mult
+        sl = entry_price + atr_val * effective_sl_mult
         tp = entry_price - atr_val * tp_mult
-    else:  # HOLD
+    else:
         return entry_price, None
 
-    # Clamp to positive minimum — negative SL/TP are invalid
     sl = max(sl, 0.01)
     if tp is not None:
         tp = max(tp, 0.01)
 
-    # Rounding by quote currency (detected from symbol suffix)
     upper = symbol.upper()
     if "JPY" in upper or "KRW" in upper:
         decimals = 0
@@ -115,17 +141,18 @@ def generate_signal(
     atr_14: float,
     strategy_signal: StrategySignal,
     backtest_result,  # BacktestResult
+    timeframe: str = "1d",
+    atr_50: float = 0.0,
     sl_mult: float = 1.5,
     tp_mult: float = 3.0,
 ) -> Signal:
     """Generate a structured Signal from strategy output and backtest."""
-    # Use strategy's trigger_price for signal_strength; fall back to entry_price
     trigger = strategy_signal.trigger_price if strategy_signal.trigger_price else entry_price
     confidence = compute_confidence(
         strategy_signal, backtest_result, atr_14,
         current_price=entry_price, trigger_price=trigger,
     )
-    sl, tp = compute_sl_tp(action, symbol, entry_price, atr_14, sl_mult, tp_mult)
+    sl, tp = compute_sl_tp(action, symbol, entry_price, atr_14, atr_50, sl_mult, tp_mult)
 
     return Signal(
         id=str(uuid.uuid4()),
@@ -136,6 +163,7 @@ def generate_signal(
         stop_loss=sl,
         take_profit=tp,
         strategy=strategy_signal.metadata.get("strategy_name", backtest_result.strategy_name),
+        timeframe=timeframe,
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         status="pending",
     )
@@ -147,23 +175,17 @@ def filter_signals(
     max_signals: int = 30,
     cooldown_hours: int = 24,
     cooldown_override: float = 0.80,
+    break_glass_pct: float = 0.05,
 ) -> list[Signal]:
-    """Apply quality filters to a list of signals.
+    """Apply quality filters to signals.
 
-    1. Confidence threshold: keep only conf ≥ min_confidence
-    2. Cap: keep top N by confidence
-    3. Cooldown: skip if same symbol had signal within cooldown_hours
-       (unless confidence ≥ cooldown_override)
+    1. Confidence threshold: conf ≥ min_confidence
+    2. Cap: top N by confidence
+    3. Cooldown: skip if same symbol within cooldown_hours (override at ≥cooldown_override)
+    4. Break-glass: override cooldown if price change > break_glass_pct (crash signals)
+    5. Correlation: drop lower-confidence signal from correlated pairs
 
-    Args:
-        signals: Raw signal list.
-        min_confidence: Minimum confidence to pass.
-        max_signals: Maximum signals per day.
-        cooldown_hours: Minimum hours between same-symbol signals.
-        cooldown_override: Confidence above which cooldown is ignored.
-
-    Returns:
-        Filtered and sorted signal list.
+    Returns filtered + sorted signal list.
     """
     now = datetime.now(timezone.utc)
 
@@ -176,12 +198,27 @@ def filter_signals(
     # Step 2: Sort by confidence descending
     passed.sort(key=lambda s: s.confidence, reverse=True)
 
+    # Step 5: Correlation filter (before cap, so correlated low-conf pairs don't steal slots)
+    if len(passed) > 1:
+        correlated_passed = []
+        for s in passed:
+            # Check if this signal is correlated with an already-kept signal
+            conflict = next((c for c in correlated_passed
+                           if _are_correlated(s.symbol, c.symbol)), None)
+            if conflict:
+                # Keep higher confidence one
+                logger.info("Correlation filter: dropping %s (conf=%.0f%%) — correlated with %s (conf=%.0f%%)",
+                            s.symbol, s.confidence * 100, conflict.symbol, conflict.confidence * 100)
+                continue
+            correlated_passed.append(s)
+        passed = correlated_passed
+
     # Step 3: Cap
     if len(passed) > max_signals:
         logger.warning("Signal cap reached — %d signals dropped (max %d)", len(passed) - max_signals, max_signals)
         passed = passed[:max_signals]
 
-    # Step 4: Cooldown filter (check DB)
+    # Step 4: Cooldown filter + break-glass override
     conn = None
     try:
         from src.db import get_connection
@@ -191,10 +228,22 @@ def filter_signals(
             for s in passed:
                 cutoff = (now - pd.Timedelta(hours=cooldown_hours)).isoformat()
                 row = conn.execute(
-                    "SELECT id FROM signals WHERE symbol=? AND timestamp_utc > ? LIMIT 1",
+                    "SELECT id, entry_price FROM signals WHERE symbol=? AND timestamp_utc > ? LIMIT 1",
                     (s.symbol, cutoff),
                 ).fetchone()
+
                 if row and s.confidence < cooldown_override:
+                    # Break-glass: override cooldown if price shifted > break_glass_pct since last signal
+                    last_entry = row["entry_price"]
+                    price_change = abs(s.entry_price - last_entry) / max(last_entry, 1e-10)
+                    if price_change > break_glass_pct:
+                        logger.info(
+                            "%s: break-glass — cooldown overridden (price change %.1f%% > %.1f%%)",
+                            s.symbol, price_change * 100, break_glass_pct * 100,
+                        )
+                        cooldown_passed.append(s)
+                        continue
+
                     logger.info("%s in cooldown — last signal < %dh ago (conf=%.0f%% < %.0f%%)",
                                 s.symbol, cooldown_hours, s.confidence * 100, cooldown_override * 100)
                     continue
@@ -210,14 +259,7 @@ def filter_signals(
 
 
 def save_signals(signals: list[Signal]) -> int:
-    """Persist signals to SQLite database.
-
-    Args:
-        signals: List of Signal objects to save.
-
-    Returns:
-        Number of signals saved.
-    """
+    """Persist signals to SQLite database."""
     if not signals:
         return 0
 
@@ -229,13 +271,13 @@ def save_signals(signals: list[Signal]) -> int:
             conn.execute(
                 """INSERT OR REPLACE INTO signals
                    (id, symbol, action, confidence, entry_price, stop_loss,
-                    take_profit, strategy, sentiment_score, onchain_signal,
+                    take_profit, strategy, timeframe, sentiment_score, onchain_signal,
                     macro_flag, research_metadata, timestamp_utc, status)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (s.id, s.symbol, s.action, s.confidence, s.entry_price,
-                 s.stop_loss, s.take_profit, s.strategy, s.sentiment_score,
-                 s.onchain_signal, s.macro_flag, s.research_metadata,
-                 s.timestamp_utc, s.status),
+                 s.stop_loss, s.take_profit, s.strategy, s.timeframe,
+                 s.sentiment_score, s.onchain_signal, s.macro_flag,
+                 s.research_metadata, s.timestamp_utc, s.status),
             )
         conn.commit()
         logger.info("Saved %d signals to DB", len(signals))
@@ -244,3 +286,40 @@ def save_signals(signals: list[Signal]) -> int:
             conn.close()
 
     return len(signals)
+
+
+def compute_counter_metrics(signals: list[Signal]) -> dict:
+    """Compute success + counter-metrics from today's signal batch.
+
+    Checks specified in PRD Success Metrics + Counter-Metrics sections:
+    - Signal clustering: >50% same action → warn
+    - False confidence: >70% conf but too many on same symbol
+    """
+    result: dict = {"signal_count": len(signals), "warnings": []}
+
+    if not signals:
+        return result
+
+    # Signal clustering check
+    buy_count = sum(1 for s in signals if s.action == "BUY")
+    sell_count = sum(1 for s in signals if s.action == "SELL")
+    total = buy_count + sell_count
+    if total > 0:
+        buy_pct = buy_count / total * 100
+        sell_pct = sell_count / total * 100
+        if buy_pct > 50:
+            result["warnings"].append(f"Signal clustering: {buy_pct:.0f}% BUY (threshold 50%)")
+        if sell_pct > 50:
+            result["warnings"].append(f"Signal clustering: {sell_pct:.0f}% SELL (threshold 50%)")
+
+    # High-confidence count
+    high_conf = [s for s in signals if s.confidence >= 0.70]
+    result["high_confidence_count"] = len(high_conf)
+
+    # Confidence distribution
+    if signals:
+        result["avg_confidence"] = round(sum(s.confidence for s in signals) / len(signals), 4)
+        result["max_confidence"] = max(s.confidence for s in signals)
+        result["min_confidence"] = min(s.confidence for s in signals)
+
+    return result

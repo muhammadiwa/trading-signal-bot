@@ -45,7 +45,7 @@ def _format_signal_block(signal: Signal, include_research: bool = False,
     tp_dec = _price_decimals(signal.take_profit, signal.symbol) if signal.take_profit else entry_dec
 
     lines = [
-        f"{emoji} {signal.action} — {signal.symbol} {entry_str}",
+        f"{emoji} {signal.action} — {signal.symbol} {entry_str} [{signal.timeframe}]",
         f"{signal.strategy} | Conf {signal.confidence*100:.0f}%",
         f"SL: ${_price_str(signal.stop_loss, sl_dec)} | TP: ${_price_str(signal.take_profit, tp_dec)}" if signal.take_profit
         else f"SL: ${_price_str(signal.stop_loss, sl_dec)} | TP: N/A",

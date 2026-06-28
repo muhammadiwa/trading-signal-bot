@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS signals (
     stop_loss REAL NOT NULL,
     take_profit REAL,
     strategy TEXT NOT NULL,
+    timeframe TEXT NOT NULL DEFAULT '1d',
     sentiment_score REAL,
     onchain_signal TEXT,
     macro_flag INTEGER DEFAULT 0,
