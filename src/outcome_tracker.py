@@ -6,7 +6,6 @@ Runs as Stage 0 at pipeline start, BEFORE new signal generation.
 
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 
 import pandas as pd
 
@@ -176,26 +175,3 @@ def resolve_pending_signals() -> list[dict]:
         return results
     finally:
         conn.close()
-
-
-def _compute_win_rate_7d() -> Optional[float]:
-    """Compute rolling 7-day win rate from outcomes table (AC6).
-
-    Reuses the same query pattern as main.py:_compute_7day_win_rate()
-    but remains module-contained for testing.
-    """
-    from src.db import get_connection
-
-    try:
-        conn = get_connection()
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        row = conn.execute(
-            """SELECT AVG(CASE WHEN realized_return_pct > 0 THEN 1 ELSE 0 END) AS wr
-               FROM outcomes WHERE resolved_at > ?""",
-            (cutoff,),
-        ).fetchone()
-        conn.close()
-        return round(row["wr"], 4) if row and row["wr"] is not None else None
-    except Exception as e:
-        logger.warning("Failed to compute 7-day win rate: %s", e)
-        return None

@@ -128,7 +128,8 @@ def test_delisted_symbol(mock_price, mock_conn, test_db):
 
 @patch("src.db.get_connection")
 def test_seven_day_win_rate(mock_conn, test_db):
-    from src.outcome_tracker import resolve_pending_signals, _compute_win_rate_7d
+    from src.outcome_tracker import resolve_pending_signals
+    import main as main_module
 
     _seed(test_db, "sig-w1", "BTC-USDT", "SELL", 60000.0)
     _seed(test_db, "sig-w2", "ETH-USDT", "BUY", 3000.0)
@@ -141,8 +142,7 @@ def test_seven_day_win_rate(mock_conn, test_db):
         mp.side_effect = [58500.0, 3300.0, 130.0]
         resolve_pending_signals()
 
-    # _compute_win_rate_7d gets its own connection — return same wrapped
-    wr = _compute_win_rate_7d()
+    wr = main_module._compute_7day_win_rate()
     assert wr == pytest.approx(0.6667, 0.01)
     test_db.close()
 
