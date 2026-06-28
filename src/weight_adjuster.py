@@ -27,7 +27,10 @@ UNDERPERFORM_MIN_OUTCOMES = 50
 
 
 def _clamp_weight(w: float) -> float:
-    """Clamp weight to [0.5, 1.5]."""
+    """Clamp weight to [0.5, 1.5]. Returns 1.0 for NaN."""
+    import math
+    if math.isnan(w):
+        return 1.0
     return max(WEIGHT_FLOOR, min(WEIGHT_CEIL, w))
 
 
