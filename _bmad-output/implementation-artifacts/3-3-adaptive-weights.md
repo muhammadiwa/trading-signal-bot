@@ -4,7 +4,7 @@ story_key: 3-3-adaptive-weights
 epic: 3
 story: 3
 title: Adaptive Weight Adjustment
-status: ready-for-dev
+status: review
 created: 2026-06-28
 ---
 
@@ -63,34 +63,34 @@ So that the system improves its signal accuracy over time without manual tuning.
 
 ## Tasks/Subtasks
 
-- [ ] **T1: Create `src/weight_adjuster.py`** — Weight computation engine
+- [x] **T1: Create `src/weight_adjuster.py`** — Weight computation engine
   - [ ] T1.1 `compute_source_accuracy(source, outcomes)` — per-source accuracy over last 30 outcomes
   - [ ] T1.2 `load_weights()` — read current weights from SQLite, init defaults if empty
   - [ ] T1.3 `adjust_weights(outcomes)` — EMA update, clamp [0.5,1.5], persist to DB
   - [ ] T1.4 Underperformance detection + Telegram alert (AC4)
   - [ ] T1.5 Insufficient data gate — skip if <30 outcomes (AC3)
 
-- [ ] **T2: Update `src/research_scoring.py`** — Dynamic multiplier
-  - [ ] T2.1 Read weights from DB in `sentiment_mult()` + `onchain_mult()`
-  - [ ] T2.2 Dynamic formula: `1.0 + (score − 50) / 50 × weight` for sentiment
-  - [ ] T2.3 Dynamic formula for on-chain: `1.0 + (direction_sign) × onchain_weight × 0.15`
+- [x] **T2: Update `src/research_scoring.py`** — Dynamic multiplier
+  - [x] T2.1 Read weights from DB in `sentiment_mult()` + `onchain_mult()`
+  - [x] T2.2 Dynamic formula: `1.0 + (score − 50) / 50 × weight` for sentiment
+  - [x] T2.3 Dynamic formula for on-chain: `1.0 + (direction_sign) × onchain_weight × 0.15`
 
-- [ ] **T3: Wire into `main.py`** — After Stage 0 reflections
-  - [ ] T3.1 Call `adjust_weights()` after `generate_reflections()`
-  - [ ] T3.2 Log weight changes
+- [x] **T3: Wire into `main.py`** — After Stage 0 reflections
+  - [x] T3.1 Call `adjust_weights()` after `generate_reflections()`
+  - [x] T3.2 Log weight changes
 
-- [ ] **T4: Tests**
-  - [ ] T4.1 Unit test: sentiment accuracy computation (AC1)
-  - [ ] T4.2 Unit test: EMA formula produces correct weight (AC2)
-  - [ ] T4.3 Unit test: <30 outcomes → skip (AC3)
-  - [ ] T4.4 Unit test: underperformance detection + alert (AC4)
-  - [ ] T4.5 Unit test: empty weights table → init defaults (AC5)
-  - [ ] T4.6 Unit test: weight clamp [0.5, 1.5] (AC2)
-  - [ ] T4.7 Integration test: weights written to DB + read back
+- [x] **T4: Tests**
+  - [x] T4.1 Unit test: sentiment accuracy computation (AC1)
+  - [x] T4.2 Unit test: EMA formula produces correct weight (AC2)
+  - [x] T4.3 Unit test: <30 outcomes → skip (AC3)
+  - [x] T4.4 Unit test: underperformance detection + alert (AC4)
+  - [x] T4.5 Unit test: empty weights table → init defaults (AC5)
+  - [x] T4.6 Unit test: weight clamp [0.5, 1.5] (AC2)
+  - [x] T4.7 Integration test: weights written to DB + read back
 
-- [ ] **T5: Acceptance validation**
-  - [ ] T5.1 Run `python3 -m pytest tests/ -v` — all tests pass
-  - [ ] T5.2 Manually verify AC1-AC6 against implementation
+- [x] **T5: Acceptance validation**
+  - [x] T5.1 Run `python3 -m pytest tests/ -v` — all tests pass
+  - [x] T5.2 Manually verify AC1-AC6 against implementation
 
 ---
 
@@ -207,19 +207,33 @@ weight_id                value   updated_at
 ## Dev Agent Record
 
 ### Implementation Plan
-_To be filled by dev agent during implementation._
+1. Create `src/weight_adjuster.py` — accuracy computation, EMA update, weight persistence
+2. Update `src/research_scoring.py` — backward-compatible dynamic multipliers
+3. Wire into `main.py` Stage 0 after reflections
+4. 7 unit tests covering: accuracy, EMA, clamp, skip, persistence, underperformance
 
 ### Debug Log
-_To be filled by dev agent if issues encountered._
+- Mock patch path: `src.weight_adjuster.get_connection` (module-level import)
+- MIN_OUTCOMES check removed from accuracy functions (only at adjust_weights level)
+- Underperformance check requires >= 50 outcomes total
 
 ### Completion Notes
-_To be filled by dev agent after completion._
+✅ All 5 task groups complete. 7 new tests + 44 existing = 51/51 passing.
+Weights adjust after Stage 0 reflections via EMA. Sentiment/onchain use
+dynamic multipliers from DB weights. Backward compatible — no weight defaults
+to static behavior. Underperformance triggers Telegram alert at <40% accuracy
+for 50+ outcomes.
 
 ---
 
 ## File List
 
-_To be filled during implementation._
+| File | Action |
+|------|--------|
+| `src/weight_adjuster.py` | NEW — weight computation + persistence |
+| `src/research_scoring.py` | UPDATE — dynamic multiplier from DB weights |
+| `main.py` | UPDATE — wire adjust_weights after Stage 0 reflections |
+| `tests/test_weight_adjuster.py` | NEW — 7 tests |
 
 ---
 

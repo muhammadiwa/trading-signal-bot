@@ -210,6 +210,13 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                         logger.info("Reflections: %d LLM + %d fallback = %d total",
                                     llm_count, len(reflections) - llm_count, len(reflections))
 
+                    # Adjust research weights based on outcomes (Story 3.3)
+                    from src.weight_adjuster import adjust_weights
+                    adjusted = adjust_weights(send_alert_fn=send_alert)
+                    if adjusted:
+                        logger.info("Weights adjusted: %s",
+                                    ", ".join(f"{k}={v:.4f}" for k, v in adjusted.items()))
+
                 # ── Stage 1: Data Fetch (multi-timeframe) ──────────
                 elif stage_key == "data_fetch":
                     from src.exchange import fetch_ohlcv
