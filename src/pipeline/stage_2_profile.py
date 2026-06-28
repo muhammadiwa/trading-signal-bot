@@ -30,53 +30,51 @@ def match_strategy(profile: PairProfile) -> list:
     Returns strategies in priority order. First match might fail backtest,
     so caller tries them in sequence.
 
+    Unclear profiles (no rule matched) → ensemble (all 5 strategies vote).
+
     Args:
         profile: PairProfile with 4-dimension scores.
 
     Returns:
         List of strategy instances, best-matched first.
     """
-    ranked = []
+    matched = []
 
     # Rule 1: Strong trend + good volume → Trend Following
     if profile.trendiness > 60 and profile.volume_quality > 50:
-        ranked.append(TrendFollowing())
+        matched.append(TrendFollowing())
 
     # Rule 2: High mean-reversion + low trend → Mean Reversion
     if profile.mean_reversion > 60 and profile.trendiness < 40:
-        ranked.append(MeanReversion())
+        matched.append(MeanReversion())
 
     # Rule 3: High volatility + high volume → Momentum Breakout
     if profile.volatility > 60 and profile.volume_quality > 50:
-        ranked.append(MomentumBreakout())
+        matched.append(MomentumBreakout())
 
     # Rule 4: High volatility + low volume → Volatility Breakout
     if profile.volatility > 60 and profile.volume_quality < 40:
-        ranked.append(VolatilityBreakout())
+        matched.append(VolatilityBreakout())
 
-    # Add remaining strategies (not yet matched) in default order
-    for cls in _ALL_STRATEGIES:
-        inst = cls()
-        if not any(type(s) is type(inst) for s in ranked):
-            ranked.append(inst)
-
-    # If nothing matched or unclear profile, log and use all
-    if not ranked:
-        logger.info("Unclear profile for %s — using ensemble (all strategies)", profile.symbol)
-        ranked = [cls() for cls in _ALL_STRATEGIES]
-    elif len(ranked) == 1 and ranked[0].name == "Volume-Price Divergence":
-        # Only weakest strategy matched → unclear, ensemble all
+    # Ensemble fallback: no rule matched → unclear profile, vote all 5
+    if not matched:
         logger.info(
             "Unclear profile for %s (trend=%.0f vol=%.0f mr=%.0f vq=%.0f) — using ensemble",
             profile.symbol, profile.trendiness, profile.volatility,
             profile.mean_reversion, profile.volume_quality,
         )
-        ranked = [cls() for cls in _ALL_STRATEGIES]
+        return [cls() for cls in _ALL_STRATEGIES]
+
+    # Add remaining strategies as fallbacks after matched ones
+    for cls in _ALL_STRATEGIES:
+        inst = cls()
+        if not any(type(s) is type(inst) for s in matched):
+            matched.append(inst)
 
     # VolumeDivergence always last (weakest standalone)
-    ranked.sort(key=lambda s: 1 if isinstance(s, VolumeDivergence) else 0)
+    matched.sort(key=lambda s: 1 if isinstance(s, VolumeDivergence) else 0)
 
-    return ranked
+    return matched
 
 
 def find_best_strategy(
@@ -85,6 +83,7 @@ def find_best_strategy(
     symbol: str = "unknown",
     min_win_rate: float = 0.40,
     min_sharpe: float = 0.5,
+    walk_forward_enabled: bool = False,
 ) -> tuple[Optional[object], Optional[BacktestResult], list[BacktestResult]]:
     """Find the best strategy for a pair through profile matching + backtest.
 
@@ -93,12 +92,16 @@ def find_best_strategy(
     3. Backtest each candidate in priority order
     4. Return first that passes gates (win_rate ≥ min, sharpe ≥ min)
 
+    Walk-forward (80/20 split) is used when config flag is enabled AND
+    data has > 12 months (~365 bars). Otherwise full backtest.
+
     Args:
         ohlcv: Full OHLCV DataFrame.
         indicators: Pre-computed indicators.
         symbol: Trading pair symbol.
         min_win_rate: Minimum win rate gate (default 0.40).
         min_sharpe: Minimum Sharpe ratio gate (default 0.5).
+        walk_forward_enabled: Whether to use walk-forward validation.
 
     Returns:
         Tuple of (best_strategy | None, best_result | None, all_results).
@@ -117,8 +120,7 @@ def find_best_strategy(
     best_result = None
 
     for strategy in candidates:
-        # Auto-enable walk-forward validation if data > 12 months (~365 bars)
-        use_walk_forward = len(ohlcv) > 365
+        use_walk_forward = walk_forward_enabled and len(ohlcv) > 365
         train_ratio = 0.8 if use_walk_forward else 1.0
         result = run_backtest(strategy, ohlcv, indicators, train_ratio=train_ratio)
         all_results.append(result)

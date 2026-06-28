@@ -62,8 +62,9 @@ def compute(ohlcv: pd.DataFrame, indicators: dict[str, pd.Series],
     volume = ohlcv["volume"].iloc[-window:]
 
     # 1. Trendiness: ADX average + % time in trending regime (ADX > 25)
-    adx_avg = float(adx.mean()) if not adx.isna().all() else 0.0
-    adx_trending_pct = float((adx > 25).mean()) * 100
+    adx_valid = adx.dropna()
+    adx_avg = float(adx_valid.mean()) if len(adx_valid) > 0 else 0.0
+    adx_trending_pct = float((adx > 25).mean()) * 100 if len(adx) > 0 else 0.0
     trendiness = min(100.0, (adx_avg / 50) * 60 + adx_trending_pct * 0.4)
 
     # 2. Volatility: ATR/close ratio normalized

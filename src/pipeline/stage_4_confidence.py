@@ -75,7 +75,8 @@ def compute_sl_tp(
     BUY:  SL = entry - ATR×sl_mult, TP = entry + ATR×tp_mult
     SELL: SL = entry + ATR×sl_mult, TP = entry - ATR×tp_mult
 
-    Rounding: 2dp for USD pairs, 0dp for JPY/KRW, 4dp for small caps.
+    SL/TP are clamped to a minimum of 0.01 to prevent negative/invalid prices.
+    Rounding: 0dp for JPY/KRW pairs, 2dp for large-cap (>1000), 4dp mid, 6dp small.
     """
     atr_val = max(atr_14, 1e-8)
 
@@ -87,6 +88,11 @@ def compute_sl_tp(
         tp = entry_price - atr_val * tp_mult
     else:  # HOLD
         return entry_price, None
+
+    # Clamp to positive minimum — negative SL/TP are invalid
+    sl = max(sl, 0.01)
+    if tp is not None:
+        tp = max(tp, 0.01)
 
     # Rounding by quote currency (detected from symbol suffix)
     upper = symbol.upper()
@@ -113,9 +119,11 @@ def generate_signal(
     tp_mult: float = 3.0,
 ) -> Signal:
     """Generate a structured Signal from strategy output and backtest."""
+    # Use strategy's trigger_price for signal_strength; fall back to entry_price
+    trigger = strategy_signal.trigger_price if strategy_signal.trigger_price else entry_price
     confidence = compute_confidence(
         strategy_signal, backtest_result, atr_14,
-        current_price=entry_price, trigger_price=entry_price,
+        current_price=entry_price, trigger_price=trigger,
     )
     sl, tp = compute_sl_tp(action, symbol, entry_price, atr_14, sl_mult, tp_mult)
 

@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS run_log (
     pairs_analyzed INTEGER DEFAULT 0,
     signals_generated INTEGER DEFAULT 0,
     duration_seconds REAL,
-    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed')),
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed', 'timeout', 'aborted')),
     stage_failed INTEGER,
     error_summary TEXT
 );
@@ -100,8 +100,12 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
         raise PermissionError(f"Cannot create database directory: {db_dir}")
 
     conn = sqlite3.connect(db_path)
-    _configure_connection(conn)
-    conn.executescript(SCHEMA)
+    try:
+        _configure_connection(conn)
+        conn.executescript(SCHEMA)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
