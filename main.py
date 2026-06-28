@@ -543,6 +543,10 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # Load .env first so all modules have access to env vars
+    from src.config import _load_dotenv
+    _load_dotenv(Path(__file__).resolve().parent / ".env")
+
     logger.info("Trading Signal Pipeline starting...")
     init_db().close()
     from src.db import run_migrations
@@ -554,7 +558,6 @@ if __name__ == "__main__":
     elif args.pipeline:
         run_pipeline()
     elif args.bot:
-        # Start scheduler (unless disabled) + bot in parallel
         import threading
         from src.telegram_bot import start_bot as start_tg_bot
 
