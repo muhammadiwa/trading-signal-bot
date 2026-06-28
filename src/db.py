@@ -59,6 +59,17 @@ CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp_utc);
 CREATE INDEX IF NOT EXISTS idx_outcomes_signal ON outcomes(signal_id);
 CREATE INDEX IF NOT EXISTS idx_outcomes_resolved_at ON outcomes(resolved_at);
 CREATE INDEX IF NOT EXISTS idx_run_log_started ON run_log(started_at);
+
+CREATE TABLE IF NOT EXISTS llm_call_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt TEXT,
+    response TEXT,
+    tokens_used INTEGER,
+    cost REAL,
+    called_at TEXT NOT NULL,
+    model TEXT,
+    status TEXT NOT NULL CHECK(status IN ('success', 'timeout', 'error'))
+);
 """
 
 PRAGMAS = """
