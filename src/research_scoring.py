@@ -8,13 +8,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def sentiment_mult(fear_greed_val: float | None) -> float:
+def _get_dynamic_weights() -> dict[str, float]:
+    """Read weights from SQLite, returning defaults if unavailable."""
+    defaults = {"sentiment_weight": 1.0, "onchain_weight": 1.0,
+                "macro_weight": 1.0, "prediction_weight": 1.0}
+    try:
+        from src.db import get_connection
+        conn = get_connection()
+        try:
+            rows = conn.execute("SELECT weight_id, value FROM weights").fetchall()
+            if rows:
+                result = {}
+                for r in rows:
+                    val = r["value"]
+                    result[r["weight_id"]] = float(val) if val is not None else defaults.get(r["weight_id"], 1.0)
+                return result
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Failed to read weights from DB: %s — using defaults", e)
+    return defaults
+
+
+def sentiment_mult(fear_greed_val: float | None, weight: float | None = None) -> float:
     """Convert Fear & Greed score to confidence multiplier (FR3.1).
 
-    - composite > 60 → 1.2 (greed/bullish — boost confidence)
-    - composite 40-60 → 1.0 (neutral — no change)
-    - composite < 40 → 0.8 (fear/bearish — reduce confidence)
-    - None or NaN → 1.0 (no data)
+    Static (weight=None): >60→1.2, 40-60→1.0, <40→0.8, None→1.0
+    Dynamic: 1.0 + (score − 50) / 50 × weight (Story 3.3 AC6)
     """
     import math
     if fear_greed_val is None:
@@ -22,6 +42,11 @@ def sentiment_mult(fear_greed_val: float | None) -> float:
     if math.isnan(fear_greed_val):
         logger.warning("sentiment_mult: NaN input — returning neutral 1.0")
         return 1.0
+
+    if weight is not None:
+        return round(max(0.5, min(1.5, 1.0 + (fear_greed_val - 50) / 50 * weight)), 4)
+
+    # Static defaults
     if fear_greed_val > 60:
         return 1.2
     if fear_greed_val < 40:
@@ -29,18 +54,23 @@ def sentiment_mult(fear_greed_val: float | None) -> float:
     return 1.0
 
 
-def onchain_mult(onchain_signal: str | None) -> float:
-    """Convert on-chain signal to confidence multiplier (FR3.2).
+def onchain_mult(onchain_signal: str | None, weight: float | None = None) -> float:
+    """Convert on-chain signal to confidence multiplier (FR3.2 + Story 3.3).
 
-    - bullish → 1.15
-    - neutral → 1.0
-    - bearish → 0.85
-    - None → 1.0 (no data)
+    Static: bullish→1.15, neutral→1.0, bearish→0.85
+    Dynamic: 1.0 + sign × weight × 0.15
     """
     if not onchain_signal:
         return 1.0
+
+    signal_lower = onchain_signal.lower()
+    if weight is not None:
+        sign_map = {"bullish": 1, "neutral": 0, "bearish": -1}
+        sign = sign_map.get(signal_lower, 0)
+        return round(max(0.5, min(1.5, 1.0 + sign * weight * 0.15)), 4)
+
     mapping = {"bullish": 1.15, "neutral": 1.0, "bearish": 0.85}
-    return mapping.get(onchain_signal.lower(), 1.0)
+    return mapping.get(signal_lower, 1.0)
 
 
 def compute_research_multiplier(
@@ -65,9 +95,12 @@ def compute_research_multiplier(
     Returns:
         Multiplier: 0.5-1.5. 1.0 = no adjustment, >1 = boost, <1 = reduce.
     """
-    sent = sentiment_mult(sentiment_score)
-    onch = onchain_mult(onchain_signal)
-    macro = macro_penalty if macro_has_event else 0.0
+    # Read dynamic weights from DB (Story 3.3)
+    weights = _get_dynamic_weights()
+
+    sent = sentiment_mult(sentiment_score, weight=weights.get("sentiment_weight"))
+    onch = onchain_mult(onchain_signal, weight=weights.get("onchain_weight"))
+    macro = (macro_penalty * weights.get("macro_weight", 1.0)) if macro_has_event else 0.0
 
     # Count active sources (4 dimensions: sentiment, on-chain, macro, prediction)
     active_count = int(sentiment_score is not None) + int(onchain_signal is not None)
