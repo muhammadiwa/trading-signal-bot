@@ -485,3 +485,119 @@ def macro_flag_for_date(target_date: Optional[datetime] = None,
             continue
 
     return False, 0.0, None
+
+
+# ============================================================
+# Story 2.4: Prediction Markets Fetcher (FR1.5)
+# ============================================================
+
+# Crypto-relevant keywords for filtering Polymarket events
+POLYMARKET_CRYPTO_KEYWORDS = [
+    "btc", "bitcoin", "eth", "ethereum", "crypto", "rate", "fed",
+    "regulation", "sec", "etf", "halving", "defi", "stablecoin",
+]
+
+# Last successful fetch timestamp for freshness check
+_polymarket_last_fetch: Optional[float] = None
+_polymarket_cache: Optional[list[dict]] = None
+
+
+def fetch_polymarket(category: str = "crypto", limit: int = 20) -> Optional[list[dict]]:
+    """Fetch top Polymarket prediction probabilities from Gamma API.
+
+    Filters to crypto-relevant markets, stores top 5 by 24h volume.
+
+    Returns list of market dicts: {question, probability, volume_24h, slug}.
+    Returns None on failure.
+    """
+    global _polymarket_last_fetch, _polymarket_cache
+
+    try:
+        resp = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={
+                "tag": category,
+                "limit": limit,
+                "closed": "false",
+                "order": "volume24hr",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        markets = resp.json()
+    except Exception as e:
+        logger.warning("Polymarket API unavailable — prediction markets skipped: %s", e)
+        return None
+
+    if not markets:
+        return None
+
+    # Filter to crypto-relevant markets
+    relevant = []
+    for m in markets:
+        question = (m.get("question", "") or "").lower()
+        if any(kw in question for kw in POLYMARKET_CRYPTO_KEYWORDS):
+            prob = m.get("probability")
+            relevant.append({
+                "question": m.get("question", ""),
+                "probability": float(prob) if prob is not None else None,
+                "volume_24h": m.get("volume24hr", 0),
+                "slug": m.get("slug", ""),
+            })
+
+    # Top 5 by volume
+    relevant.sort(key=lambda x: x["volume_24h"], reverse=True)
+    top5 = relevant[:5]
+
+    # Cache for freshness check
+    _polymarket_last_fetch = time.time()
+    _polymarket_cache = top5
+
+    logger.info("Polymarket: %d crypto-relevant markets, top 5 selected", len(relevant))
+    return top5
+
+
+def polymarket_prediction_adjustment(symbol: str,
+                                     markets: Optional[list[dict]]) -> float:
+    """Compute prediction market adjustment for a symbol (FR4).
+
+    Rules:
+      - Find markets matching the symbol
+      - If probability > 70% for bullish context → +0.05
+      - If probability > 70% for bearish context → −0.05
+      - No clear direction → 0.0
+
+    Context classification is heuristic: keyword-based sentiment.
+    """
+    if not markets:
+        return 0.0
+
+    base = symbol.split("-")[0].lower() if symbol else ""
+    bullish_keywords = {"buy", "bull", "up", "rise", "rally", "approve", "etf", "halving"}
+    bearish_keywords = {"sell", "bear", "down", "crash", "ban", "reject", "decline", "tighten"}
+
+    for m in markets:
+        question = (m.get("question", "") or "").lower()
+        prob = m.get("probability")
+        if prob is None or prob <= 0.70:
+            continue
+        if base not in question:
+            continue
+
+        # Determine direction
+        words = set(question.split())
+        if words & bullish_keywords:
+            logger.debug("Polymarket: bullish %s at %.0f%% → +0.05", base, prob * 100)
+            return 0.05
+        elif words & bearish_keywords:
+            logger.debug("Polymarket: bearish %s at %.0f%% → −0.05", base, prob * 100)
+            return -0.05
+
+    return 0.0
+
+
+def polymarket_is_fresh(max_age_hours: int = 12) -> bool:
+    """Check if cached Polymarket data is fresh (≤12 hours old per AC)."""
+    if _polymarket_last_fetch is None:
+        return False
+    return (time.time() - _polymarket_last_fetch) < max_age_hours * 3600
