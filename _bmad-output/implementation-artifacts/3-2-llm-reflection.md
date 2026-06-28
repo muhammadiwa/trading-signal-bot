@@ -4,7 +4,7 @@ story_key: 3-2-llm-reflection
 epic: 3
 story: 2
 title: LLM Reflection Generator
-status: in-progress
+status: review
 created: 2026-06-28
 ---
 
@@ -209,19 +209,27 @@ response = requests.post(
 ## Dev Agent Record
 
 ### Implementation Plan
-_To be filled by dev agent during implementation._
-
-### Debug Log
-_To be filled by dev agent if issues encountered._
+1. Create `src/reflection.py` — build_reflection_prompt, generate_reflection, generate_reflections, fallback, truncation
+2. Wire into `main.py` Stage 0 after outcome resolution
+3. Add `llm_call_log` table to `db.py` schema
+4. 8 unit tests covering: prompt, fallback, truncation, LLM failure, no API key, success, DB storage
 
 ### Completion Notes
-_To be filled by dev agent after completion._
+✅ All 5 task groups complete. 8 new tests + 36 existing = 44/44 passing.
+LLM reflection runs after Stage 0 outcome resolution. Each resolved signal
+gets a 1-2 sentence reflection via TokenRouter API with 3s timeout.
+Deterministic fallback on any failure. Never crashes the pipeline.
 
 ---
 
 ## File List
 
-_To be filled during implementation._
+| File | Action |
+|------|--------|
+| `src/reflection.py` | NEW — LLM reflection engine |
+| `main.py` | UPDATE — wire reflection after Stage 0 |
+| `src/db.py` | UPDATE — llm_call_log table |
+| `tests/test_reflection.py` | NEW — 8 tests |
 
 ---
 
