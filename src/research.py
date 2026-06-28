@@ -479,7 +479,7 @@ def macro_flag_for_date(target_date: Optional[datetime] = None,
                 return True, penalty, warning
             elif hours_away <= 48:
                 penalty = 0.10 if impact == "high" else 0.05
-                warning = f"{event_name} in 2 days — volatility expected"
+                warning = f"{event_name} in 2 days — elevated volatility expected"
                 return True, penalty, warning
         except (ValueError, KeyError):
             continue
