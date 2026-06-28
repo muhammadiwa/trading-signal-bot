@@ -195,6 +195,21 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                     logger.info("Outcome resolution complete: %d signals resolved", len(resolved))
                     _win_rate_7d_cache = _compute_7day_win_rate()
 
+                    # Generate LLM reflections for resolved outcomes (Story 3.2)
+                    if resolved:
+                        from src.reflection import generate_reflections
+                        api_key = os.getenv("TOKENROUTER_API_KEY", "")
+                        base_url = os.getenv("TOKENROUTER_BASE_URL", "https://api.tokenrouter.com/v1")
+                        reflections = generate_reflections(
+                            resolved, api_key, base_url,
+                            model=config.llm_model,
+                            timeout=config.llm_timeout_seconds,
+                            max_tokens=config.llm_max_tokens,
+                        )
+                        llm_count = sum(1 for r in reflections if r.get("llm_used"))
+                        logger.info("Reflections: %d LLM + %d fallback = %d total",
+                                    llm_count, len(reflections) - llm_count, len(reflections))
+
                 # ── Stage 1: Data Fetch (multi-timeframe) ──────────
                 elif stage_key == "data_fetch":
                     from src.exchange import fetch_ohlcv
