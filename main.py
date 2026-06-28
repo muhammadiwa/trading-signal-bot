@@ -1,12 +1,16 @@
-"""Main pipeline orchestrator — nightly batch runner with scheduling."""
+"""Main pipeline orchestrator — nightly batch runner with scheduling.
+
+Multi-timeframe support (1h, 4h, 1d) — each timeframe generates independent
+signals so the user sees which interval the signal targets: scalp (1h),
+swing (4h), or trend (1d).
+"""
 
 import json
 import logging
 import os
-import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -17,7 +21,10 @@ from src.db import init_db, get_connection
 
 logger = logging.getLogger(__name__)
 
-# Stage pipeline definition (ordered)
+# Timeframes to analyze (ordered: longest first for cache reuse)
+TIME_FRAMES = ["1d", "4h", "1h"]
+
+# Stage pipeline definition
 STAGES = [
     ("data_fetch", "Stage 1: Data Fetch"),
     ("profile_match", "Stage 2: Profile + Strategy Match"),
@@ -26,25 +33,13 @@ STAGES = [
     ("telegram_deliver", "Stage 5: Telegram Delivery"),
 ]
 
-# Health check tiers: critical failures → abort; non-critical → warn + continue
-CRITICAL_SOURCES = {
-    "ccxt": "Exchange data (CCXT)",
-    "telegram": "Telegram bot token",
-}
-NON_CRITICAL_SOURCES = {
-    "alternative_me": "Fear & Greed Index (Alternative.me)",
-}
+CRITICAL_SOURCES = {"ccxt": "Exchange data (CCXT)", "telegram": "Telegram bot token"}
+NON_CRITICAL_SOURCES = {"alternative_me": "Fear & Greed Index (Alternative.me)"}
 
 
 def health_check(config: Settings) -> dict[str, bool]:
-    """Verify data sources are reachable before pipeline start.
-
-    Returns:
-        Dict mapping source name to True (reachable) or False (failed).
-    """
+    """Verify data sources are reachable before pipeline start."""
     results = {}
-
-    # CCXT check
     try:
         import ccxt
         exchange = ccxt.binance({"enableRateLimit": True, "timeout": 30000})
@@ -54,8 +49,6 @@ def health_check(config: Settings) -> dict[str, bool]:
     except Exception as e:
         logger.error("CCXT health check failed: %s", e)
         results["ccxt"] = False
-
-    # Alternative.me check
     try:
         import requests
         resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
@@ -63,19 +56,12 @@ def health_check(config: Settings) -> dict[str, bool]:
     except Exception as e:
         logger.error("Alternative.me health check failed: %s", e)
         results["alternative_me"] = False
-
-    # Telegram check
     results["telegram"] = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
-
     return results
 
 
 def send_alert(message: str) -> bool:
-    """Send a critical alert to Telegram. Synchronous, best-effort.
-
-    Uses raw HTTP POST (no asyncio) so it works from any thread,
-    including the APScheduler worker.
-    """
+    """Send critical alert to Telegram via sync HTTP (works from any thread)."""
     try:
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -83,26 +69,50 @@ def send_alert(message: str) -> bool:
             return False
         import requests
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        resp = requests.post(
-            url,
-            json={"chat_id": chat_id, "text": f"⚠️ Pipeline Alert\n{message}"},
-            timeout=10,
-        )
+        resp = requests.post(url, json={"chat_id": chat_id, "text": f"⚠️ Pipeline Alert\n{message}"}, timeout=10)
         return resp.status_code == 200
     except Exception as e:
         logger.error("Failed to send alert: %s", e)
     return False
 
 
-def run_pipeline(config: Optional[Settings] = None) -> dict:
-    """Execute the full nightly pipeline.
+def fetch_top_symbols(config: Settings) -> list[str]:
+    """Fetch top coin symbols from CoinGecko public API.
 
-    Args:
-        config: Settings object. Loads from default if None.
-
-    Returns:
-        Dict with run summary: status, pairs_analyzed, signals_generated, duration.
+    Falls back to hardcoded default if API fails.
     """
+    try:
+        import requests
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": config.top_coins_limit,
+            "page": 1,
+            "sparkline": "false",
+        }
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        symbols = []
+        for coin in data:
+            symbol = coin.get("symbol", "").upper()
+            if not symbol:
+                continue
+            # Exclude stablecoins if configured
+            if config.top_coins_exclude_stablecoins and symbol in ("USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP"):
+                continue
+            symbols.append(f"{symbol}-USDT")
+        logger.info("Fetched %d top coins from CoinGecko", len(symbols))
+        return symbols
+    except Exception as e:
+        logger.warning("CoinGecko trending API failed: %s — using default symbols", e)
+        return ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
+                "ADA-USDT", "DOGE-USDT", "DOT-USDT", "AVAX-USDT", "MATIC-USDT"]
+
+
+def run_pipeline(config: Optional[Settings] = None) -> dict:
+    """Execute the full multi-timeframe nightly pipeline."""
     if config is None:
         config = load_config()
 
@@ -114,18 +124,17 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
     stage_failed = None
     error_summary = None
 
-    # Inter-stage shared state
-    pair_results: dict = {}      # symbol → {best_strategy, best_result, profile}
-    research_results: dict = {}  # symbol → {sentiment, onchain, macro, multiplier}
-    filtered_signals: list = []  # Signals after filter (populated in stage 4)
+    # Inter-stage state
+    # Key: "sym|tf" → {best_strategy, best_result, ohlcv, indicators}
+    pair_results: dict = {}
+    research_results: dict = {}
+    filtered_signals: list = []
 
-    # Initialize DB
+    # DB init
     conn = init_db()
     try:
-        conn.execute(
-            "INSERT INTO run_log (started_at, status) VALUES (?, ?)",
-            (datetime.now(timezone.utc).isoformat(), "running"),
-        )
+        conn.execute("INSERT INTO run_log (started_at, status) VALUES (?, ?)",
+                     (datetime.now(timezone.utc).isoformat(), "running"))
         run_log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
     finally:
@@ -133,32 +142,24 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
 
     try:
         # ── Health check ──────────────────────────────────────────
-        hc_results = health_check(config)
-        critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in hc_results.items()
+        hc = health_check(config)
+        critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in hc.items()
                           if k in CRITICAL_SOURCES and not v]
-        non_critical_failed = [NON_CRITICAL_SOURCES.get(k, k) for k, v in hc_results.items()
+        non_critical_failed = [NON_CRITICAL_SOURCES.get(k, k) for k, v in hc.items()
                               if k in NON_CRITICAL_SOURCES and not v]
-
         if critical_failed:
-            logger.error("Health check FAILED — skipping pipeline: %s", ", ".join(critical_failed))
+            logger.error("Health check FAILED: %s", ", ".join(critical_failed))
             send_alert(f"Pipeline dibatalkan — health check gagal: {', '.join(critical_failed)}")
-            status = "aborted"
-            return {
-                "run_id": run_id, "status": status,
-                "pairs_analyzed": 0, "signals_generated": 0, "duration_seconds": 0,
-            }
+            return {"run_id": run_id, "status": "aborted",
+                    "pairs_analyzed": 0, "signals_generated": 0, "duration_seconds": 0}
         if non_critical_failed:
-            logger.warning(
-                "Non-critical sources unavailable: %s — continuing pipeline",
-                ", ".join(non_critical_failed),
-            )
+            logger.warning("Non-critical down: %s — continuing", ", ".join(non_critical_failed))
 
         # ── Phase 0: Identity resolution ──────────────────────────
-        logger.info("Pipeline %s starting — fetching top %d coins", run_id, config.top_coins_limit)
-        symbols = ["BTC-USDT", "ETH-USDT"]  # Placeholder (Epic 2+ will fetch real top coins)
+        symbols = fetch_top_symbols(config)
         pairs_analyzed = len(symbols)
+        logger.info("Pipeline %s: %d pairs × %d timeframes", run_id, pairs_analyzed, len(TIME_FRAMES))
 
-        # Pipeline artifact root
         pipeline_dir = Path("data") / "pipeline" / run_id
         pipeline_dir.mkdir(parents=True, exist_ok=True)
 
@@ -167,74 +168,57 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
             elapsed = time.monotonic() - start_time
             warning_threshold = (config.runtime_budget_minutes - 5) * 60
             if elapsed > warning_threshold:
-                logger.warning("Pipeline approaching timeout — %.0f min elapsed", elapsed / 60)
-
+                logger.warning("Pipeline approaching timeout — %.0f min", elapsed / 60)
             if elapsed > config.runtime_budget_minutes * 60:
-                logger.error("Pipeline timeout — terminating at stage: %s", stage_name)
+                logger.error("Pipeline timeout at stage: %s", stage_name)
                 status = "timeout"
-                # Deliver whatever signals we have so far
                 if filtered_signals:
                     from src.telegram_sender import send_daily_signals
                     send_daily_signals(filtered_signals, pairs_analyzed, None, include_research=True)
-                    send_alert(f"⏰ Pipeline timeout — {len(filtered_signals)} sinyal dikirim (hasil parsial)")
-                else:
-                    send_alert(f"⏰ Pipeline timeout — tidak ada sinyal tersedia untuk {pairs_analyzed} pair")
                 break
 
             stage_dir = pipeline_dir / f"stage_{idx}_{stage_key}"
             stage_dir.mkdir(parents=True, exist_ok=True)
 
             try:
-                logger.info("Running %s (artifacts → %s)", stage_name, stage_dir)
+                logger.info("Running %s", stage_name)
 
-                # ── Stage 1: Data Fetch ───────────────────────────
+                # ── Stage 1: Data Fetch (multi-timeframe) ──────────
                 if stage_key == "data_fetch":
                     from src.exchange import fetch_ohlcv
                     from src.indicators import save_with_indicators
                     for sym in symbols:
-                        try:
-                            df = fetch_ohlcv(sym, force_refresh=True,
-                                            max_age_hours=config.freshness_max_hours)
-                            # Compute indicators and save OHLCV + indicators in one file
-                            save_with_indicators(df, f"data/ohlcv/{sym}.parquet")
-                            logger.info("Fetched + indicators saved: %s (%d rows)", sym, len(df))
-                        except Exception as e:
-                            logger.error("Data fetch failed for %s: %s", sym, e)
+                        for tf in TIME_FRAMES:
+                            try:
+                                df = fetch_ohlcv(sym, timeframe=tf, force_refresh=True,
+                                                max_age_hours=config.freshness_max_hours)
+                                save_with_indicators(df, f"data/ohlcv/{sym}-{tf}.parquet")
+                                logger.debug("Fetched %s %s (%d rows)", sym, tf, len(df))
+                            except Exception as e:
+                                logger.error("Fetch failed %s %s: %s", sym, tf, e)
 
                 # ── Stage 2: Profile + Strategy Match ──────────────
                 elif stage_key == "profile_match":
                     from src.indicators import load_with_indicators
                     from src.pipeline.stage_2_profile import find_best_strategy
                     for sym in symbols:
-                        try:
-                            df = load_with_indicators(f"data/ohlcv/{sym}.parquet")
-                            indicator_keys = [k for k in df.columns
-                                            if k not in ("timestamp", "open", "high", "low", "close", "volume")]
-                            ind = {k: df[k] for k in indicator_keys}
-                            best_strategy, best_result, all_results = find_best_strategy(
-                                df, ind, sym, config.min_win_rate, config.min_sharpe,
-                                walk_forward_enabled=config.walk_forward_enabled,
-                            )
-                            pair_results[sym] = {
-                                "best_strategy": best_strategy,
-                                "best_result": best_result,
-                                "all_results": all_results,
-                                "ohlcv": df,
-                                "indicators": ind,
-                            }
-                        except Exception:
-                            logger.warning("Profile match failed for %s", sym, exc_info=True)
-
-                    # Write stage artifact
-                    stage_summary = {
-                        sym: {
-                            "strategy": pr["best_strategy"].name if pr["best_strategy"] else None,
-                            "win_rate": pr["best_result"].win_rate if pr["best_result"] else None,
-                            "passed": pr["best_result"].passed if pr["best_result"] else False,
-                        }
-                        for sym, pr in pair_results.items()
-                    }
-                    (stage_dir / "profile_match.json").write_text(json.dumps(stage_summary, indent=2))
+                        for tf in TIME_FRAMES:
+                            key = f"{sym}|{tf}"
+                            try:
+                                df = load_with_indicators(f"data/ohlcv/{sym}-{tf}.parquet")
+                                indicator_keys = [k for k in df.columns
+                                                if k not in ("timestamp", "open", "high", "low", "close", "volume")]
+                                ind = {k: df[k] for k in indicator_keys}
+                                best_s, best_r, all_r = find_best_strategy(
+                                    df, ind, sym, config.min_win_rate, config.min_sharpe,
+                                    walk_forward_enabled=config.walk_forward_enabled,
+                                )
+                                pair_results[key] = {
+                                    "best_strategy": best_s, "best_result": best_r,
+                                    "all_results": all_r, "ohlcv": df, "indicators": ind,
+                                }
+                            except Exception:
+                                logger.warning("Profile match failed: %s %s", sym, tf)
 
                 # ── Stage 3: Research Context ──────────────────────
                 elif stage_key == "research_context":
@@ -245,37 +229,27 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                         polymarket_prediction_adjustment, polymarket_is_fresh,
                     )
                     from src.research_scoring import (
-                        compute_research_multiplier,
-                        sentiment_mult, onchain_mult,
+                        compute_research_multiplier, sentiment_mult, onchain_mult,
                     )
-
                     sentiment = fetch_sentiment_composite()
                     whale = fetch_whale_transactions()
                     polymarket = fetch_polymarket()
                     poly_fresh = polymarket_is_fresh()
-
-                    all_down = (
-                        sentiment.get("active_sources", 0) == 0 and
-                        whale is None and
-                        polymarket is None
-                    )
+                    all_down = (sentiment.get("active_sources", 0) == 0 and whale is None and polymarket is None)
                     if all_down:
-                        logger.warning("Research data unavailable — using technical confidence only")
                         send_alert("⚠️ Research data unavailable — signals using technical confidence only")
 
                     for sym in symbols:
                         active_addr = fetch_coingecko_active_addresses(sym)
                         onchain_signal, _ = compute_onchain(whale, active_addr, sym)
-                        has_macro, macro_pen, macro_warning = macro_flag_for_date()
+                        has_macro, macro_pen, _ = macro_flag_for_date()
                         pred_adj = polymarket_prediction_adjustment(sym, polymarket)
                         if not poly_fresh and polymarket is not None:
                             pred_adj = pred_adj * 0.5
-                            logger.info("Polymarket stale — prediction adj reduced to %+.2f", pred_adj)
                         multiplier = compute_research_multiplier(
                             sentiment_score=sentiment.get("composite"),
                             onchain_signal=onchain_signal,
-                            macro_has_event=has_macro,
-                            macro_penalty=macro_pen,
+                            macro_has_event=has_macro, macro_penalty=macro_pen,
                             prediction_adjustment=pred_adj,
                         )
                         research_results[sym] = {
@@ -283,101 +257,86 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                             "sentiment_mult": sentiment_mult(sentiment.get("composite")),
                             "onchain_signal": onchain_signal,
                             "onchain_mult": onchain_mult(onchain_signal),
-                            "macro_flag": has_macro,
-                            "macro_penalty": macro_pen,
+                            "macro_flag": has_macro, "macro_penalty": macro_pen,
                             "final_multiplier": multiplier,
                             "prediction_adjustment": pred_adj,
                         }
-                        logger.info(
-                            "Research %s: sentiment=%.0f onchain=%s macro=%s → multiplier=%.2f",
-                            sym, sentiment.get("composite", 50), onchain_signal,
-                            "yes" if has_macro else "no", multiplier,
-                        )
-
-                    # Write stage artifact
-                    (stage_dir / "research_context.json").write_text(
-                        json.dumps({sym: {k: str(v) if isinstance(v, float) else v
-                                          for k, v in rr.items()}
-                                    for sym, rr in research_results.items()}, indent=2))
 
                 # ── Stage 4: Confidence + Filter ───────────────────
                 elif stage_key == "confidence_filter":
                     from src.pipeline.stage_4_confidence import (
-                        generate_signal, filter_signals, save_signals,
+                        generate_signal, filter_signals, save_signals, compute_counter_metrics,
                     )
                     signals_list = []
-
                     for sym in symbols:
-                        pr = pair_results.get(sym)
-                        rr = research_results.get(sym, {})
-                        if pr is None or pr["best_strategy"] is None:
-                            logger.info("%s: no strategy passed — skipping signal generation", sym)
+                        pr_result = None
+                        # Multi-timeframe confirmation: prefer 1d → 4h → 1h
+                        for tf in TIME_FRAMES:
+                            key = f"{sym}|{tf}"
+                            if key in pair_results and pair_results[key]["best_strategy"] is not None:
+                                pr_result = pair_results[key]
+                                pr_tf = tf
+                                break
+                        if pr_result is None:
                             continue
 
-                        strategy = pr["best_strategy"]
-                        best_result = pr["best_result"]
-                        indicators = pr["indicators"]
-                        ohlcv_df = pr["ohlcv"]
+                        rr = research_results.get(sym, {})
+                        strategy = pr_result["best_strategy"]
+                        best_result = pr_result["best_result"]
+                        ind = pr_result["indicators"]
+                        ohlcv_df = pr_result["ohlcv"]
                         entry_price = float(ohlcv_df["close"].iloc[-1])
-                        atr_val = float(indicators.get("atr_14", pd.Series([0])).iloc[-1])
+                        atr_14 = float(ind.get("atr_14", pd.Series([0])).iloc[-1])
+                        atr_50_val = float(ind.get("atr_50", pd.Series([0])).iloc[-1]) if "atr_50" in ind else 0.0
 
                         try:
-                            strategy_signal = strategy.evaluate(ohlcv_df, indicators)
+                            sig = strategy.evaluate(ohlcv_df, ind)
                         except Exception as e:
-                            logger.warning("%s strategy eval failed: %s", sym, e)
+                            logger.warning("%s strat eval failed: %s", sym, e)
                             continue
-
-                        if strategy_signal.action == "HOLD":
+                        if sig.action == "HOLD":
                             continue
 
                         signal = generate_signal(
-                            symbol=sym,
-                            action=strategy_signal.action,
-                            entry_price=entry_price,
-                            atr_14=atr_val if not pd.isna(atr_val) else 0.0,
-                            strategy_signal=strategy_signal,
-                            backtest_result=best_result,
-                            sl_mult=config.atr_sl_multiplier,
-                            tp_mult=config.atr_tp_multiplier,
+                            symbol=sym, action=sig.action, entry_price=entry_price,
+                            atr_14=atr_14 if not pd.isna(atr_14) else 0.0,
+                            atr_50=atr_50_val if not pd.isna(atr_50_val) else 0.0,
+                            strategy_signal=sig, backtest_result=best_result,
+                            timeframe=pr_tf,
+                            sl_mult=config.atr_sl_multiplier, tp_mult=config.atr_tp_multiplier,
                         )
-
-                        # Attach research metadata
                         signal.sentiment_score = rr.get("sentiment_score")
                         signal.onchain_signal = rr.get("onchain_signal")
                         signal.macro_flag = rr.get("macro_flag", False)
                         signal.research_metadata = json.dumps(rr) if rr else None
-
                         signals_list.append(signal)
 
-                    # Filter + save
+                    # Counter-metrics
+                    metrics = compute_counter_metrics(signals_list)
+                    for w in metrics.get("warnings", []):
+                        logger.warning("Counter-metric: %s", w)
+
                     filtered_signals = filter_signals(
-                        signals_list,
-                        config.min_confidence,
-                        config.max_signals_per_day,
+                        signals_list, config.min_confidence, config.max_signals_per_day,
                         cooldown_hours=config.cooldown_hours,
                         cooldown_override=config.cooldown_override_confidence,
                     )
                     signals_generated = save_signals(filtered_signals)
-                    logger.info("Confidence filter: %d generated, %d passed, %d saved",
-                                len(signals_list), len(filtered_signals), signals_generated)
+                    logger.info("Signals: %d generated, %d passed, %d saved | avg_conf=%.0f%%",
+                                len(signals_list), len(filtered_signals), signals_generated,
+                                metrics.get("avg_confidence", 0) * 100)
 
                     # Write stage artifact
-                    (stage_dir / "signals.json").write_text(json.dumps(
-                        [{"id": s.id, "symbol": s.symbol, "action": s.action,
-                          "confidence": s.confidence, "entry_price": s.entry_price,
-                          "strategy": s.strategy}
-                         for s in filtered_signals], indent=2))
+                    (stage_dir / "metrics.json").write_text(json.dumps({
+                        **metrics, "signals_generated": len(signals_list),
+                        "signals_passed": len(filtered_signals),
+                    }, indent=2))
 
                 # ── Stage 5: Telegram Delivery ─────────────────────
                 elif stage_key == "telegram_deliver":
                     from src.telegram_sender import send_daily_signals
-
-                    if not filtered_signals:
-                        logger.warning("No filtered signals available — sending empty report")
-                    success = send_daily_signals(
-                        filtered_signals, pairs_analyzed, None,
-                        include_research=True,
-                    )
+                    success = send_daily_signals(filtered_signals, pairs_analyzed,
+                                                None, include_research=True)
                     if not success:
                         logger.error("Telegram delivery failed — signals saved to DB only")
 
@@ -399,85 +358,131 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
 
     finally:
         duration = time.monotonic() - start_time
-        # Update run_log
+        # Compute 7-day win rate for run_log
+        win_rate_7d = _compute_7day_win_rate()
         try:
             conn = get_connection()
             conn.execute(
                 """UPDATE run_log SET completed_at=?, pairs_analyzed=?,
                    signals_generated=?, duration_seconds=?, status=?,
-                   stage_failed=?, error_summary=?
+                   stage_failed=?, error_summary=?, win_rate_7d=?
                    WHERE id=?""",
                 (datetime.now(timezone.utc).isoformat(), pairs_analyzed,
                  signals_generated, round(duration, 1), status,
-                 stage_failed, error_summary, run_log_id),
+                 stage_failed, error_summary, win_rate_7d, run_log_id),
             )
             conn.commit()
             conn.close()
         except Exception:
             logger.error("Failed to update run_log")
 
-        # Completion message
         if status == "completed":
-            send_alert(f"✅ Pipeline selesai — {pairs_analyzed} pair dianalisa, {signals_generated} sinyal dalam {duration:.0f}s")
+            send_alert(f"✅ Pipeline selesai — {pairs_analyzed} pair, {signals_generated} sinyal dalam {duration:.0f}s")
         elif status == "timeout":
-            send_alert(f"⏰ Pipeline timeout — hasil parsial dikirim ({pairs_analyzed} pair, {signals_generated} sinyal)")
+            send_alert(f"⏰ Pipeline timeout — hasil parsial dikirim ({signals_generated} sinyal)")
 
         logger.info("Pipeline %s finished: status=%s duration=%.0fs", run_id, status, duration)
 
-    return {
-        "run_id": run_id,
-        "status": status,
-        "pairs_analyzed": pairs_analyzed,
-        "signals_generated": signals_generated,
-        "duration_seconds": round(duration, 1),
-    }
+        # ── Saturday weekly digest ─────────────────────────────────
+        today = datetime.now(timezone.utc)
+        if today.weekday() == 5:  # Saturday
+            try:
+                _send_weekly_digest()
+            except Exception as e:
+                logger.error("Weekly digest failed: %s", e)
+
+    return {"run_id": run_id, "status": status,
+            "pairs_analyzed": pairs_analyzed,
+            "signals_generated": signals_generated,
+            "duration_seconds": round(duration, 1)}
+
+
+def _compute_7day_win_rate() -> Optional[float]:
+    """Compute rolling 7-day signal win rate from outcomes table."""
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            """SELECT AVG(CASE WHEN realized_return_pct > 0 THEN 1 ELSE 0 END) AS wr
+               FROM outcomes WHERE resolved_at > ?""",
+            ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),),
+        ).fetchone()
+        conn.close()
+        return round(row["wr"], 4) if row and row["wr"] is not None else None
+    except Exception:
+        return None
+
+
+def _send_weekly_digest() -> None:
+    """Send Saturday morning weekly performance digest."""
+    try:
+        conn = get_connection()
+        now = datetime.now(timezone.utc)
+        week_ago = (now - timedelta(days=7)).isoformat()
+
+        # Weekly stats
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM outcomes WHERE resolved_at > ?", (week_ago,)
+        ).fetchone()
+        wins = conn.execute(
+            "SELECT COUNT(*) AS n FROM outcomes WHERE resolved_at > ? AND realized_return_pct > 0",
+            (week_ago,),
+        ).fetchone()
+
+        total_n = total["n"] if total else 0
+        win_n = wins["n"] if wins else 0
+        win_rate = (win_n / total_n * 100) if total_n > 0 else 0.0
+
+        # Best strategy
+        best = conn.execute(
+            """SELECT strategy, AVG(CASE WHEN realized_return_pct > 0 THEN 1 ELSE 0 END) AS wr,
+                      COUNT(*) AS n
+               FROM outcomes JOIN signals ON outcomes.signal_id = signals.id
+               WHERE outcomes.resolved_at > ?
+               GROUP BY strategy ORDER BY wr DESC LIMIT 1""",
+            (week_ago,),
+        ).fetchone()
+
+        conn.close()
+
+        lines = [
+            "📈 WEEKLY DIGEST — Trading Signal",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"Minggu ini: {total_n} sinyal, {win_n} win ({win_rate:.1f}%)",
+        ]
+        if best and best["n"] >= 3:
+            lines.append(f"🏆 Best: {best['strategy']} ({best['wr']*100:.0f}% win, {best['n']}x)")
+
+        send_alert("\n".join(lines))
+    except Exception as e:
+        logger.error("Weekly digest failed: %s", e)
 
 
 def start_scheduler():
     """Start the APScheduler for nightly pipeline execution."""
     from apscheduler.schedulers.background import BackgroundScheduler
-
     config = load_config()
     hour, minute = map(int, config.cron_time_utc.split(":"))
-
     scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        run_pipeline,
-        "cron",
-        hour=hour,
-        minute=minute,
-        id="nightly_pipeline",
-        name="Trading Signal Pipeline",
-    )
-
+    scheduler.add_job(run_pipeline, "cron", hour=hour, minute=minute,
+                      id="nightly_pipeline", name="Trading Signal Pipeline")
     scheduler.start()
-    logger.info("Scheduler started — pipeline will run daily at %02d:%02d UTC", hour, minute)
+    logger.info("Scheduler started — daily at %02d:%02d UTC", hour, minute)
 
-    # Run health check on startup
-    results = health_check(config)
-    critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in results.items()
-                      if k in CRITICAL_SOURCES and not v]
-    non_critical_failed = [NON_CRITICAL_SOURCES.get(k, k) for k, v in results.items()
-                          if k in NON_CRITICAL_SOURCES and not v]
-    if critical_failed:
-        logger.error("Health check FAILED: %s", ", ".join(critical_failed))
-        send_alert(f"Health check gagal: {', '.join(critical_failed)}")
+    hc = health_check(config)
+    critical = [CRITICAL_SOURCES.get(k, k) for k, v in hc.items() if k in CRITICAL_SOURCES and not v]
+    if critical:
+        logger.error("Health check FAILED: %s", ", ".join(critical))
+        send_alert(f"Health check gagal: {', '.join(critical)}")
     else:
-        status_msg = "all sources reachable"
-        if non_critical_failed:
-            status_msg += f" (non-critical down: {', '.join(non_critical_failed)})"
-        logger.info("Health check passed — %s", status_msg)
-
+        logger.info("Health check passed")
     return scheduler
 
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger.info("Trading Signal Pipeline starting...")
-    # init_db only once to ensure tables exist; run_pipeline calls its own init
     init_db().close()
     run_pipeline()
