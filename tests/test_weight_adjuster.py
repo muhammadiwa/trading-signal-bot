@@ -189,4 +189,5 @@ def test_underperformance_alerts(mock_conn, test_db):
 
     result = adjust_weights(send_alert_fn=lambda msg: alerts.append(msg))
     assert result is not None
+    assert len(alerts) > 0, "Underperformance alert should fire when accuracy < 40% for 50+ outcomes"
     test_db.close()

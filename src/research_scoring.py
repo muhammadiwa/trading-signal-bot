@@ -15,12 +15,18 @@ def _get_dynamic_weights() -> dict[str, float]:
     try:
         from src.db import get_connection
         conn = get_connection()
-        rows = conn.execute("SELECT weight_id, value FROM weights").fetchall()
-        conn.close()
-        if rows:
-            return {r["weight_id"]: r["value"] for r in rows}
-    except Exception:
-        pass
+        try:
+            rows = conn.execute("SELECT weight_id, value FROM weights").fetchall()
+            if rows:
+                result = {}
+                for r in rows:
+                    val = r["value"]
+                    result[r["weight_id"]] = float(val) if val is not None else defaults.get(r["weight_id"], 1.0)
+                return result
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Failed to read weights from DB: %s — using defaults", e)
     return defaults
 
 

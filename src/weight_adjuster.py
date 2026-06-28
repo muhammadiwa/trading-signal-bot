@@ -114,7 +114,7 @@ def _compute_sentiment_accuracy(conn) -> float:
 def _compute_onchain_accuracy(conn) -> float:
     """Accuracy of on-chain signal direction vs outcome."""
     rows = conn.execute(
-        """SELECT s.onchain_signal, o.realized_return_pct
+        """SELECT s.action, s.onchain_signal, o.realized_return_pct
            FROM signals s JOIN outcomes o ON s.id = o.signal_id
            WHERE o.realized_return_pct IS NOT NULL
              AND s.onchain_signal IS NOT NULL AND s.onchain_signal != ''
@@ -123,18 +123,29 @@ def _compute_onchain_accuracy(conn) -> float:
     ).fetchall()
 
     correct = 0
+    total = 0
     for row in rows:
-        signal = row["onchain_signal"].lower()
+        signal = row["onchain_signal"].strip().lower()
+        action = row["action"]
         is_win = row["realized_return_pct"] > 0
 
-        if signal == "bullish" and is_win:
-            correct += 1
-        elif signal == "bearish" and not is_win:
-            correct += 1
-        elif signal == "neutral":
-            pass
+        if signal == "neutral":
+            continue  # Skip neutral — no directional prediction
+        elif signal == "bullish":
+            # Bullish predicted BUY success; correct if (BUY+win) or (SELL+loss)
+            if (action == "BUY" and is_win) or (action == "SELL" and not is_win):
+                correct += 1
+        elif signal == "bearish":
+            # Bearish predicted SELL success; correct if (SELL+win) or (BUY+loss)
+            if (action == "SELL" and is_win) or (action == "BUY" and not is_win):
+                correct += 1
+        else:
+            # Unknown — skip (log warning once per run)
+            continue
 
-    return correct / len(rows) if len(rows) > 0 else 0.5
+        total += 1
+
+    return correct / total if total > 0 else 0.5
 
 
 def _compute_macro_accuracy(conn) -> float:
@@ -150,14 +161,14 @@ def _compute_macro_accuracy(conn) -> float:
     if len(rows) < 10:
         return 0.5  # Not enough macro-tagged outcomes
 
-    correct = sum(1 for r in rows if r["realized_return_pct"] <= 0)
+    correct = sum(1 for r in rows if r["realized_return_pct"] < 0)
     return correct / len(rows)
 
 
 def _compute_prediction_accuracy(conn) -> float:
     """Accuracy of prediction market adjustment vs outcome direction."""
     rows = conn.execute(
-        """SELECT s.research_metadata, o.realized_return_pct
+        """SELECT s.action, s.research_metadata, o.realized_return_pct
            FROM signals s JOIN outcomes o ON s.id = o.signal_id
            WHERE o.realized_return_pct IS NOT NULL
              AND s.research_metadata IS NOT NULL AND s.research_metadata != ''
@@ -176,9 +187,14 @@ def _compute_prediction_accuracy(conn) -> float:
         if pred == 0:
             continue
         is_win = row["realized_return_pct"] > 0
-        # pred > 0 = bullish adjustment → predict win
-        # pred < 0 = bearish adjustment → predict loss
-        if (pred > 0 and is_win) or (pred < 0 and not is_win):
+        action = row["action"]
+        # pred > 0 = bullish → predict BUY works, SELL fails
+        # pred < 0 = bearish → predict SELL works, BUY fails
+        if pred > 0:
+            predicted_correctly = (action == "BUY" and is_win) or (action == "SELL" and not is_win)
+        else:
+            predicted_correctly = (action == "SELL" and is_win) or (action == "BUY" and not is_win)
+        if predicted_correctly:
             correct += 1
         total += 1
 
