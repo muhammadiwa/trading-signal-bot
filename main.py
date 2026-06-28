@@ -531,13 +531,38 @@ def start_scheduler():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Trading Signal Bot")
+    parser.add_argument("--bot", action="store_true", help="Start interactive Telegram bot")
+    parser.add_argument("--no-scheduler", action="store_true", help="Don't start cron scheduler")
+    parser.add_argument("--pipeline", action="store_true", help="Run pipeline once and exit")
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger.info("Trading Signal Pipeline starting...")
     init_db().close()
-    # Run schema migrations for backward compatibility (retro AI #2, #4)
     from src.db import run_migrations
     run_migrations()
-    run_pipeline()
+
+    # Default: run pipeline once
+    if not args.bot and not args.pipeline:
+        run_pipeline()
+    elif args.pipeline:
+        run_pipeline()
+    elif args.bot:
+        # Start scheduler (unless disabled) + bot in parallel
+        import threading
+        from src.telegram_bot import start_bot as start_tg_bot
+
+        if not args.no_scheduler:
+            sched = start_scheduler()
+            logger.info("Scheduler + Bot running in parallel")
+        else:
+            logger.info("Bot only mode (no scheduler)")
+
+        # Bot runs in main thread
+        start_tg_bot()

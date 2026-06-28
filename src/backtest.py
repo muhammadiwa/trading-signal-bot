@@ -22,6 +22,11 @@ class BacktestResult:
     total_trades: int
     total_return: float  # 0.0 - 1.0
     passed: bool = False  # Did it meet minimum gates?
+    trade_log: list = None  # Individual trade records for display
+
+    def __post_init__(self):
+        if self.trade_log is None:
+            self.trade_log = []
 
 
 class StrategyLike(Protocol):
@@ -190,6 +195,16 @@ def run(
     # Gate check: win_rate >= 40% AND sharpe >= 0.5
     passed = win_rate >= 0.40 and sharpe >= 0.5
 
+    # Build trade log with return per trade
+    trade_log = []
+    for t in trades:
+        r = (t["exit"] - t["entry"]) / t["entry"] if t["action"] == "BUY" else (t["entry"] - t["exit"]) / t["entry"]
+        trade_log.append({
+            "action": t["action"], "entry": round(t["entry"], 2),
+            "exit": round(t["exit"], 2), "return_pct": round(r * 100, 2),
+            "win": r > 0,
+        })
+
     return BacktestResult(
         strategy_name=strategy.name,
         win_rate=round(win_rate, 4),
@@ -199,4 +214,5 @@ def run(
         total_trades=total,
         total_return=round(total_return, 4),
         passed=passed,
+        trade_log=trade_log,
     )
