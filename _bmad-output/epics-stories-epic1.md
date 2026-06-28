@@ -9,7 +9,7 @@ So that all subsequent stories have a solid foundation to build upon.
 **Given** a fresh checkout of the repository
 **When** I run `pip install -r requirements.txt`
 **Then** all dependencies install without errors
-**And** `python -c "import ccxt, pandas, pandas_ta, pyarrow, requests, telegram, apscheduler; print('OK')"` succeeds
+**And** `python -c "import ccxt, numpy, pandas, pyarrow, requests, telegram, apscheduler, yaml; print('OK')"` succeeds
 
 **Given** the project directory exists
 **When** I create `config/settings.yaml` with watchlist, thresholds, and API endpoints
@@ -171,7 +171,7 @@ So that each pair uses the strategy most suited to its characteristics.
 
 **Given** a PairProfile with no clear dominant characteristic
 **When** the matcher runs
-**Then** selects Ensemble mode (all 5 strategies vote)
+**Then** selects Ensemble mode (try all strategies in priority order)
 **And** logs: "Unclear profile for {symbol} — using ensemble"
 
 **Given** a matched strategy

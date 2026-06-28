@@ -70,7 +70,7 @@ All signal-critical computation (indicators, strategy evaluation, backtesting, c
 OHLCV: CCXT (free). Sentiment: Alternative.me (free). On-chain: Whale Alert (free). Macro: manual JSON. Prediction: Polymarket (free). No paid API dependencies in MVP.
 
 ### CON-8: Environment
-Python 3.14. Libraries: ccxt, pandas, pandas-ta, pyarrow, python-telegram-bot, apscheduler, requests. Storage: Parquet + SQLite. No Redis, no Postgres, no Docker required.
+Python 3.14. Libraries: ccxt, numpy, pandas, pyarrow, python-telegram-bot, apscheduler, requests, pyyaml. Storage: Parquet + SQLite. No Redis, no Postgres, no Docker required.
 
 ---
 

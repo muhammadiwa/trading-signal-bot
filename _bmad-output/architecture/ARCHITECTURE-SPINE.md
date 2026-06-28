@@ -87,9 +87,9 @@ inputs: prd.md, brainstorm-intent.md
 
 **Prevents:** Duplicate computation across 5 strategies × 100 pairs. Inconsistent indicator implementations across strategies.
 
-**Rule:** `src/indicators.py` exports `compute_all(ohlcv) → dict[str, pd.Series]`. Uses `pandas-ta` library (installed). Strategies access via dict keys, not method calls.
+**Rule:** `src/indicators.py` exports `compute_all(ohlcv) → dict[str, pd.Series]`. Pure numpy/pandas implementation — no external TA library dependency (Python 3.14 compatibility). Strategies access via dict keys, not method calls.
 
-**[ADOPTED]** — pandas-ta installed and verified. Vibe-Trading uses same pattern.
+**[ADOPTED]** — pure numpy/pandas verified and working. Vibe-Trading uses same pattern.
 
 ---
 
@@ -99,7 +99,7 @@ inputs: prd.md, brainstorm-intent.md
 
 **Prevents:** Complex bot state management. Webhook infrastructure. User expectation of interactivity.
 
-**Rule:** `src/telegram/sender.py` exposes `send_daily_signals(signals: list[Signal]) → bool`. Single function, single responsibility.
+**Rule:** `src/telegram_sender.py` exposes `send_daily_signals(signals: list[Signal]) → bool`. Single function, single responsibility.
 
 **[ADOPTED]** — PRD scope: single user, daily batch, no execution. python-telegram-bot installed.
 
@@ -160,7 +160,7 @@ trading-signal/
 │   │   ├── mean_reversion.py
 │   │   ├── volatility_breakout.py
 │   │   └── volume_divergence.py
-│   ├── indicators.py              # pandas-ta wrapper
+│   ├── indicators.py              # pure numpy/pandas implementation (no pandas-ta)
 │   ├── backtest.py                # Backtest runner + metrics
 │   ├── profile.py                 # 4D profile computation
 │   ├── research.py                # Sentiment, on-chain, macro scoring
@@ -175,7 +175,7 @@ trading-signal/
 │   └── settings.yaml              # Watchlist, thresholds, API endpoints
 ├── main.py                        # Entry point: cron → run_pipeline()
 ├── .env                           # API keys (gitignored)
-└── requirements.txt               # ccxt, pandas, pandas-ta, pyarrow,
+└── requirements.txt               # ccxt, pandas, pyarrow,
                                    # python-telegram-bot, apscheduler, requests
 ```
 

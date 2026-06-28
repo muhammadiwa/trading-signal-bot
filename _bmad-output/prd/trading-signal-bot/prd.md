@@ -59,7 +59,7 @@ A nightly batch pipeline that analyzes the top 100 coins through technical backt
 
 **FR2.2 — Strategy Library**: Implement 5 strategies as pure functions: Momentum Breakout, Trend Following (MA crossover), Mean Reversion (RSI + Bollinger), Volatility Breakout (ATR channel), Volume-Price Divergence.
 
-**FR2.3 — Strategy-Pair Matching**: Match profile to strategy using deterministic rules. Unclear profiles → ensemble voting (all 5 strategies).
+**FR2.3 — Strategy-Pair Matching**: Match profile to strategy using deterministic rules. Unclear profiles → try all strategies in priority order (fallback to Volume-Price Divergence last).
 
 **FR2.4 — Backtest Validator**: Run matched strategy on 6-month historical data. Gate: win rate ≥ 40%, Sharpe ≥ 0.5. If fail → try next best strategy. If all fail → drop pair for today.
 
@@ -73,7 +73,7 @@ A nightly batch pipeline that analyzes the top 100 coins through technical backt
 
 **FR3.3 — Macro Overlay**: High-impact event within 24h → −20% confidence penalty. Within 48h → −10%. Medium-impact → half penalty.
 
-**FR3.4 — Research Multiplier**: `Research_Multiplier = sentiment_mult × onchain_mult × (1 − macro_penalty)`. Clamped to [0.5, 1.5].
+**FR3.4 — Research Multiplier**: `Research_Multiplier = sentiment_mult × onchain_mult × (1 − macro_penalty) + prediction_adjustment`. Clamped to [0.5, 1.5].
 
 ### FR4: Signal Generation
 
