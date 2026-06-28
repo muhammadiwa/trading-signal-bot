@@ -26,12 +26,16 @@ TIME_FRAMES = ["1d", "4h", "1h"]
 
 # Stage pipeline definition
 STAGES = [
+    ("outcome_resolution", "Stage 0: Outcome Resolution"),
     ("data_fetch", "Stage 1: Data Fetch"),
     ("profile_match", "Stage 2: Profile + Strategy Match"),
     ("research_context", "Stage 3: Research Context"),
     ("confidence_filter", "Stage 4: Confidence + Filter"),
     ("telegram_deliver", "Stage 5: Telegram Delivery"),
 ]
+
+# Accumulated 7-day win rate — set by Stage 0, consumed by Stage 5
+_win_rate_7d_cache: Optional[float] = None
 
 CRITICAL_SOURCES = {"ccxt": "Exchange data (CCXT)", "telegram": "Telegram bot token"}
 NON_CRITICAL_SOURCES = {"alternative_me": "Fear & Greed Index (Alternative.me)"}
@@ -183,8 +187,15 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
             try:
                 logger.info("Running %s", stage_name)
 
+                # ── Stage 0: Outcome Resolution ────────────────────
+                if stage_key == "outcome_resolution":
+                    from src.outcome_tracker import resolve_pending_signals
+                    resolved = resolve_pending_signals()
+                    logger.info("Outcome resolution complete: %d signals resolved", len(resolved))
+                    _win_rate_7d_cache = _compute_7day_win_rate()
+
                 # ── Stage 1: Data Fetch (multi-timeframe) ──────────
-                if stage_key == "data_fetch":
+                elif stage_key == "data_fetch":
                     from src.exchange import fetch_ohlcv
                     from src.indicators import save_with_indicators
                     for sym in symbols:
@@ -349,7 +360,7 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                 elif stage_key == "telegram_deliver":
                     from src.telegram_sender import send_daily_signals
                     success = send_daily_signals(filtered_signals, pairs_analyzed,
-                                                None, include_research=True)
+                                                _win_rate_7d_cache, include_research=True)
                     if not success:
                         logger.error("Telegram delivery failed — signals saved to DB only")
 
@@ -371,8 +382,8 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
 
     finally:
         duration = time.monotonic() - start_time
-        # Compute 7-day win rate for run_log
-        win_rate_7d = _compute_7day_win_rate()
+        # Use cached 7-day win rate from Stage 0, or compute fresh
+        win_rate_7d = _win_rate_7d_cache if _win_rate_7d_cache is not None else _compute_7day_win_rate()
         try:
             conn = get_connection()
             conn.execute(
