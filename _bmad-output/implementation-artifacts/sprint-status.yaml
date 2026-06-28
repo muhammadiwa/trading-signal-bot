@@ -81,15 +81,15 @@ action_items:
   - epic: 1
     action: "Selalu uji pipeline end-to-end sebelum merge — minimal smoke test"
     owner: "Kumaha-sia"
-    status: open
+    status: done
   - epic: 1
     action: "Schema changes harus ALTER TABLE untuk backward compat"
     owner: "Kumaha-sia"
-    status: open
+    status: done
   - epic: 2
     action: "Dokumentasikan data source limitation — CoinGecko proxy, Reddit tanpa 24h filter"
     owner: "Kumaha-sia"
-    status: open
+    status: done
   - epic: 3
     action: "Tambahkan DB migration helper — function ensure_column/ensure_table yang idempoten"
     owner: "Kumaha-sia"
