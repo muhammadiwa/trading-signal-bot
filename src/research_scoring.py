@@ -14,9 +14,13 @@ def sentiment_mult(fear_greed_val: float | None) -> float:
     - composite > 60 → 1.2 (greed/bullish — boost confidence)
     - composite 40-60 → 1.0 (neutral — no change)
     - composite < 40 → 0.8 (fear/bearish — reduce confidence)
-    - None → 1.0 (no data)
+    - None or NaN → 1.0 (no data)
     """
+    import math
     if fear_greed_val is None:
+        return 1.0
+    if math.isnan(fear_greed_val):
+        logger.warning("sentiment_mult: NaN input — returning neutral 1.0")
         return 1.0
     if fear_greed_val > 60:
         return 1.2
@@ -65,13 +69,17 @@ def compute_research_multiplier(
     onch = onchain_mult(onchain_signal)
     macro = macro_penalty if macro_has_event else 0.0
 
-    # Count active sources
-    active = sum(1 for v in [sentiment_score, onchain_signal, macro_has_event] if v is not None)
+    # Count active sources (4 dimensions: sentiment, on-chain, macro, prediction)
+    active_count = int(sentiment_score is not None) + int(onchain_signal is not None)
+    if macro_has_event:
+        active_count += 1
+    if prediction_adjustment != 0.0:
+        active_count += 1
     total_sources = 4
-    if active == 0:
+    if active_count == 0:
         logger.warning("Research multiplier: 0 of %d sources active — using technical confidence only", total_sources)
-    elif active < total_sources:
-        logger.info("Research multiplier: %d of %d sources active", active, total_sources)
+    elif active_count < total_sources:
+        logger.info("Research multiplier: %d of %d sources active", active_count, total_sources)
 
     multiplier = sent * onch * (1.0 - macro) + prediction_adjustment
     clamped = max(0.5, min(1.5, multiplier))

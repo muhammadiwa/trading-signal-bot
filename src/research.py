@@ -4,6 +4,7 @@ Fear & Greed Index + Reddit RSS sentiment. Twitter/X unavailable (free API dead)
 Auto-normalizes weights when sources are missing. Never crashes — returns neutral.
 """
 
+import json
 import logging
 import os
 import re
@@ -92,6 +93,9 @@ def fetch_reddit_sentiment() -> Optional[dict]:
     Searches r/CryptoCurrency and r/bitcoin. Counts bullish vs bearish
     keyword mentions in post titles. No API key required.
 
+    Note: sort=new&limit=25 approximates "last 24h" — active subreddits
+    produce 25+ posts within hours. Full 24h window requires Reddit API key.
+
     Returns dict with: bullish_count, bearish_count, total_posts, ratio (0-1).
     Returns None if all feeds fail.
     """
@@ -112,7 +116,7 @@ def fetch_reddit_sentiment() -> Optional[dict]:
                 bearish_total += s
                 posts_total += t
             except Exception as e:
-                logger.debug("Reddit %s/%s fetch failed: %s", subreddit, keyword, e)
+                logger.warning("Reddit %s/%s fetch failed: %s", subreddit, keyword, e)
 
     if posts_total == 0:
         logger.warning("Reddit sentiment: 0 posts parsed across all feeds")
@@ -240,10 +244,23 @@ def fetch_whale_transactions(min_value_usd: int = 1_000_000) -> Optional[dict]:
     buy_volume = sell_volume = 0.0
 
     for tx in txs:
-        amount = tx.get("amount_usd", 0)
-        # Heuristic: transactions TO exchanges are sells, FROM are buys
-        to_owner = (tx.get("to", {}) or {}).get("owner_type", "")
-        from_owner = (tx.get("from", {}) or {}).get("owner_type", "")
+        amount = tx.get("amount_usd", 0) or 0
+        # Guard: None/null values in JSON deserialize to None
+        if not isinstance(amount, (int, float)):
+            amount = 0
+        # Heuristic: transactions TO exchanges are sells, FROM are buys.
+        # Whale Alert API may return "to"/"from" as dict, str, or None.
+        # Normalize: if string → treat as owner_type directly; if None/dict → extract
+        def _safe_owner(field):
+            val = tx.get(field)
+            if isinstance(val, str):
+                return val
+            if isinstance(val, dict):
+                return val.get("owner_type", "")
+            return ""
+
+        to_owner = _safe_owner("to")
+        from_owner = _safe_owner("from")
 
         if to_owner == "exchange":
             sell_count += 1
@@ -321,7 +338,7 @@ def fetch_coingecko_active_addresses(symbol: str) -> Optional[dict]:
             "trend": trend,
         }
     except Exception as e:
-        logger.debug("CoinGecko active address fetch for %s failed: %s", symbol, e)
+        logger.warning("CoinGecko active address fetch for %s failed: %s", symbol, e)
     return None
 
 
@@ -406,7 +423,6 @@ def load_macro_calendar() -> list[dict]:
         return []
 
     try:
-        import json
         with open(calendar_path, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, list):
@@ -464,27 +480,40 @@ def macro_flag_for_date(target_date: Optional[datetime] = None,
     if not events:
         return False, 0.0, None
 
+    best_penalty = 0.0
+    best_warning = None
+    has_event = False
+
     for ev in events:
         try:
             ev_date = datetime.strptime(ev["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            # Treat calendar-date events as active until end of day (23:59 UTC)
+            # Prevents midnight boundary from making same-day events invisible
+            ev_date = ev_date.replace(hour=23, minute=59)
             hours_away = (ev_date - target_date).total_seconds() / 3600
             if hours_away < 0:
-                continue  # Past event
+                continue  # Past event (yesterday or earlier)
             impact = ev.get("impact", "medium")
             event_name = ev.get("event", "Unknown")
 
             if hours_away <= 24:
                 penalty = 0.20 if impact == "high" else 0.10
                 warning = f"{event_name} in {hours_away:.0f}h — elevated volatility expected"
-                return True, penalty, warning
             elif hours_away <= 48:
                 penalty = 0.10 if impact == "high" else 0.05
-                warning = f"{event_name} in 2 days — elevated volatility expected"
-                return True, penalty, warning
+                hours_text = "tomorrow" if hours_away <= 36 else "2 days"
+                warning = f"{event_name} {hours_text} — elevated volatility expected"
+            else:
+                continue
+
+            if penalty > best_penalty:
+                best_penalty = penalty
+                best_warning = warning
+                has_event = True
         except (ValueError, KeyError):
             continue
 
-    return False, 0.0, None
+    return has_event, best_penalty, best_warning
 
 
 # ============================================================
@@ -573,13 +602,22 @@ def polymarket_prediction_adjustment(symbol: str,
         return 0.0
 
     base = symbol.split("-")[0].lower() if symbol else ""
+    if not base:
+        return 0.0  # Guard: empty symbol → no prediction adjustment
     bullish_keywords = {"buy", "bull", "up", "rise", "rally", "approve", "etf", "halving"}
     bearish_keywords = {"sell", "bear", "down", "crash", "ban", "reject", "decline", "tighten"}
 
     for m in markets:
         question = (m.get("question", "") or "").lower()
         prob = m.get("probability")
-        if prob is None or prob <= 0.70:
+        # Guard: None probability from API null values
+        if prob is None:
+            continue
+        try:
+            prob = float(prob)
+        except (TypeError, ValueError):
+            continue
+        if prob <= 0.70:
             continue
         if base not in question:
             continue

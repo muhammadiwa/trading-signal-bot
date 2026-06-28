@@ -235,14 +235,17 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                     whale = fetch_whale_transactions()
                     polymarket = fetch_polymarket()
                     poly_fresh = polymarket_is_fresh()
-                    all_down = (sentiment.get("active_sources", 0) == 0 and whale is None and polymarket is None)
-                    if all_down:
+                    # Determine if research is globally unavailable (for AC2.5 all-defaulted)
+                    research_unavailable = (sentiment.get("active_sources", 0) == 0 and whale is None and polymarket is None)
+                    if research_unavailable:
                         send_alert("⚠️ Research data unavailable — signals using technical confidence only")
+
+                    # Call macro_flag_for_date ONCE (global, not per-symbol)
+                    has_macro, macro_pen, _ = macro_flag_for_date()
 
                     for sym in symbols:
                         active_addr = fetch_coingecko_active_addresses(sym)
                         onchain_signal, _ = compute_onchain(whale, active_addr, sym)
-                        has_macro, macro_pen, _ = macro_flag_for_date()
                         pred_adj = polymarket_prediction_adjustment(sym, polymarket)
                         if not poly_fresh and polymarket is not None:
                             pred_adj = pred_adj * 0.5
@@ -260,6 +263,7 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                             "macro_flag": has_macro, "macro_penalty": macro_pen,
                             "final_multiplier": multiplier,
                             "prediction_adjustment": pred_adj,
+                            "research_unavailable": research_unavailable,
                         }
 
                 # ── Stage 4: Confidence + Filter ───────────────────
@@ -309,6 +313,15 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                         signal.onchain_signal = rr.get("onchain_signal")
                         signal.macro_flag = rr.get("macro_flag", False)
                         signal.research_metadata = json.dumps(rr) if rr else None
+
+                        # Apply research multiplier to technical confidence (Story 2.5 AC3)
+                        final_mult = rr.get("final_multiplier", 1.0)
+                        signal.confidence = round(max(0.0, min(1.0, signal.confidence * final_mult)), 4)
+                        if rr and not rr.get("research_unavailable", False):
+                            logger.debug("%s: confidence %.0f%% × research %.2f → %.0f%%",
+                                        sym, signal.confidence / final_mult * 100,
+                                        final_mult, signal.confidence * 100)
+
                         signals_list.append(signal)
 
                     # Counter-metrics
