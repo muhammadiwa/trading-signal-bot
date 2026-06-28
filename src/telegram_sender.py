@@ -31,23 +31,40 @@ def _format_signal_block(signal: Signal, include_research: bool = False,
     if track_record:
         lines.append(f"📈 Track: {track_record}")
 
-    # Research context (Epic 2 — populated later)
-    if include_research and signal.sentiment_score is not None:
-        lines.append(f"📊 Sentiment: {signal.sentiment_score:.0f}/100")
-    if include_research and signal.onchain_signal:
-        lines.append(f"🔗 On-chain: {signal.onchain_signal}")
-    if include_research and signal.macro_flag:
-        lines.append("📅 Macro event nearby ⚠️")
+    # Research context (Epic 2)
     if include_research and signal.research_metadata:
         import json
         try:
             meta = json.loads(signal.research_metadata)
-            mult = meta.get("final_multiplier")
-            if mult is not None and mult != 1.0:
-                direction = "boost" if mult > 1.0 else "reduce"
-                lines.append(f"🔬 Research: {direction} {abs(mult-1.0)*100:.0f}%")
         except (json.JSONDecodeError, TypeError):
-            pass
+            meta = {}
+    else:
+        meta = {}
+
+    if include_research and signal.sentiment_score is not None:
+        fg_val = signal.sentiment_score
+        classification = "Fear" if fg_val < 40 else ("Greed" if fg_val > 60 else "Neutral")
+        lines.append(f"📊 Sentiment: {classification} {fg_val:.0f}/100")
+    if include_research and signal.onchain_signal:
+        detail = signal.onchain_signal.capitalize()
+        mult = meta.get("onchain_mult")
+        if mult and mult != 1.0:
+            detail += f" (×{mult:.2f})"
+        lines.append(f"🔗 On-chain: {detail}")
+    if include_research and signal.macro_flag:
+        detail = "⚠️"
+        if meta.get("macro_penalty", 0) > 0:
+            detail = f"−{meta['macro_penalty']*100:.0f}% confidence"
+        lines.append(f"📅 Macro event nearby {detail}")
+    if include_research and signal.research_metadata and meta.get("prediction_adjustment", 0) != 0:
+        adj = meta["prediction_adjustment"]
+        direction = "bullish" if adj > 0 else "bearish"
+        lines.append(f"🗳️ Polymarket: {direction} (+{abs(adj):.2f})" if adj > 0 else f"🗳️ Polymarket: {direction} ({adj:+.2f})")
+    if include_research and meta.get("final_multiplier"):
+        mult = meta["final_multiplier"]
+        if mult != 1.0:
+            direction = "boost" if mult > 1.0 else "reduce"
+            lines.append(f"🔬 Research: {direction} {abs(mult-1.0)*100:.0f}%")
 
     return "\n".join(lines)
 
