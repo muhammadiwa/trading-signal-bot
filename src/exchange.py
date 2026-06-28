@@ -134,7 +134,7 @@ def _fetch_from_exchange(exchange_id: str, symbol: str, since_ms: int,
     Raises:
         Various CCXT exceptions on failure.
     """
-    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True, "timeout": 30000})
     try:
         normalized = _normalize_symbol(symbol)
         ohlcv = exchange.fetch_ohlcv(normalized, timeframe, since=since_ms, limit=1000)
@@ -185,7 +185,8 @@ def _fetch_from_coingecko(symbol: str, since_ms: int, timeframe: str = "1d") -> 
         raise ValueError(f"CoinGecko returned empty OHLCV for {coin_id}")
 
     df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
-    df["volume"] = 0.0  # CoinGecko OHLC doesn't include volume
+    df["volume"] = np.nan  # CoinGecko OHLC API does not include volume; NaN avoids corrupting volume-dependent computations
+    logger.warning("CoinGecko fallback for %s — volume data unavailable (set to NaN)", symbol)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df
 

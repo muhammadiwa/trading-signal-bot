@@ -89,6 +89,35 @@ class Settings:
         if not isinstance(self.llm_timeout_seconds, int) or self.llm_timeout_seconds < 1:
             errors.append(f"llm_timeout_seconds must be int >= 1, got {self.llm_timeout_seconds}")
 
+        # Pipeline constraints
+        if not isinstance(self.freshness_max_hours, (int, float)) or self.freshness_max_hours < 1:
+            errors.append(f"freshness_max_hours must be >= 1, got {self.freshness_max_hours}")
+        if not isinstance(self.runtime_budget_minutes, (int, float)) or self.runtime_budget_minutes < 5:
+            errors.append(f"runtime_budget_minutes must be >= 5, got {self.runtime_budget_minutes}")
+        if not isinstance(self.max_signals_per_day, int) or self.max_signals_per_day < 1:
+            errors.append(f"max_signals_per_day must be int >= 1, got {self.max_signals_per_day}")
+        if not isinstance(self.cooldown_hours, (int, float)) or self.cooldown_hours < 0:
+            errors.append(f"cooldown_hours must be >= 0, got {self.cooldown_hours}")
+        if not isinstance(self.cooldown_override_confidence, (int, float)) or not 0 <= self.cooldown_override_confidence <= 1:
+            errors.append(f"cooldown_override_confidence must be in [0, 1], got {self.cooldown_override_confidence}")
+        if not isinstance(self.atr_sl_multiplier, (int, float)) or self.atr_sl_multiplier <= 0:
+            errors.append(f"atr_sl_multiplier must be > 0, got {self.atr_sl_multiplier}")
+        if not isinstance(self.atr_tp_multiplier, (int, float)) or self.atr_tp_multiplier <= 0:
+            errors.append(f"atr_tp_multiplier must be > 0, got {self.atr_tp_multiplier}")
+        if not isinstance(self.top_coins_limit, int) or self.top_coins_limit < 1:
+            errors.append(f"top_coins_limit must be int >= 1, got {self.top_coins_limit}")
+
+        # cron_time_utc format validation
+        try:
+            parts = self.cron_time_utc.split(":")
+            if len(parts) != 2:
+                raise ValueError("expected HH:MM")
+            h, m = int(parts[0]), int(parts[1])
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError("hour 0-23, minute 0-59")
+        except (ValueError, AttributeError) as e:
+            errors.append(f"cron_time_utc must be 'HH:MM' (00:00–23:59), got '{self.cron_time_utc}': {e}")
+
         if errors:
             raise ConfigError("\n".join(errors))
 
@@ -116,7 +145,8 @@ def _load_dotenv(env_path: Path) -> dict[str, str]:
             key = key.strip()
             value = value.strip()
             # Remove inline comments (handles: VALUE # comment)
-            value = re.sub(r"\s+#.*$", "", value)
+            # Only strip a `#` preceded by whitespace — preserves # in URLs/tokens
+            value = re.sub(r"\s+#[^#]*$", "", value)
             # Unquote single/double quotes
             if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
                 value = value[1:-1]

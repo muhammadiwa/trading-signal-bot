@@ -20,6 +20,7 @@ class StrategySignal:
     entry_price: float
     stop_loss: float = 0.0  # 0.0 for HOLD (no trade)
     take_profit: float | None = None
+    trigger_price: float = 0.0  # Price threshold that triggered the signal (for signal_strength)
     metadata: dict = field(default_factory=dict)
 
 
@@ -42,15 +43,20 @@ class StrategyProtocol(Protocol):
 class MomentumBreakout:
     """Buy when price breaks above N-period high; sell below N-period low.
 
-    Filter: volume must confirm the breakout (volume > 1.5x SMA).
+    Optional volume confirmation filter (enabled by default) prevents false
+    breakouts on low volume. Set volume_filter_enabled=False to match the
+    bare spec (price-only breakout per AC Story 1.4).
     """
 
     name = "Momentum Breakout"
     weight = 0.25
 
-    def __init__(self, n: int = 20, k: float = 0.005):
+    def __init__(self, n: int = 20, k: float = 0.005, volume_filter_enabled: bool = True,
+                 volume_threshold: float = 1.5):
         self.n = n
         self.k = k
+        self.volume_filter_enabled = volume_filter_enabled
+        self.volume_threshold = volume_threshold
 
     def evaluate(
         self, ohlcv: pd.DataFrame, indicators: dict[str, pd.Series]
@@ -64,23 +70,29 @@ class MomentumBreakout:
         if pd.isna(high_n) or pd.isna(low_n) or pd.isna(atr_14) or pd.isna(vol_ratio):
             return StrategySignal("HOLD", 0.0, close)
 
-        if close > high_n * (1 + self.k) and vol_ratio > 1.5:
+        vol_ok = not self.volume_filter_enabled or vol_ratio > self.volume_threshold
+
+        if close > high_n * (1 + self.k) and vol_ok:
             strength = (close - high_n) / (atr_14 + 1e-10)
             conf = min(1.0, 0.5 + strength * 0.3)
+            trigger = high_n * (1 + self.k)
             return StrategySignal(
                 "BUY", conf, close,
                 stop_loss=close - atr_14 * 1.5,
                 take_profit=close + atr_14 * 3.0,
+                trigger_price=trigger,
                 metadata={"breakout": "bullish", "vol_ratio": vol_ratio},
             )
 
-        if close < low_n * (1 - self.k) and vol_ratio > 1.5:
+        if close < low_n * (1 - self.k) and vol_ok:
             strength = (low_n - close) / (atr_14 + 1e-10)
             conf = min(1.0, 0.5 + strength * 0.3)
+            trigger = low_n * (1 - self.k)
             return StrategySignal(
                 "SELL", conf, close,
                 stop_loss=close + atr_14 * 1.5,
                 take_profit=close - atr_14 * 3.0,
+                trigger_price=trigger,
                 metadata={"breakout": "bearish", "vol_ratio": vol_ratio},
             )
 
@@ -110,8 +122,22 @@ class TrendFollowing:
         self, ohlcv: pd.DataFrame, indicators: dict[str, pd.Series]
     ) -> StrategySignal:
         close = ohlcv["close"].iloc[-1]
-        ma_short = indicators[f"ma_{self.short}"]
-        ma_long = indicators[f"ma_{self.long}"]
+
+        # Get MA series — use pre-computed indicator if key exists, otherwise compute on the fly
+        short_key = f"ma_{self.short}"
+        long_key = f"ma_{self.long}"
+        close_series = ohlcv["close"]
+
+        if short_key in indicators:
+            ma_short = indicators[short_key]
+        else:
+            ma_short = close_series.rolling(window=self.short).mean()
+
+        if long_key in indicators:
+            ma_long = indicators[long_key]
+        else:
+            ma_long = close_series.rolling(window=self.long).mean()
+
         adx = indicators["adx_14"].iloc[-1]
 
         if pd.isna(ma_short.iloc[-1]) or pd.isna(ma_long.iloc[-1]) or pd.isna(adx):
@@ -136,6 +162,7 @@ class TrendFollowing:
                 "BUY", conf, close,
                 stop_loss=close - atr_val * 1.5,
                 take_profit=close + atr_val * 3.0,
+                trigger_price=close,  # Crossover trigger = current close
                 metadata={"ma_short": curr_short, "ma_long": curr_long, "adx": adx},
             )
 
@@ -145,6 +172,7 @@ class TrendFollowing:
                 "SELL", conf, close,
                 stop_loss=close + atr_val * 1.5,
                 take_profit=close - atr_val * 3.0,
+                trigger_price=close,  # Crossover trigger = current close
                 metadata={"ma_short": curr_short, "ma_long": curr_long, "adx": adx},
             )
 
@@ -194,6 +222,7 @@ class MeanReversion:
                 "BUY", conf, close,
                 stop_loss=close - atr_val * 1.5,
                 take_profit=close + atr_val * 3.0,
+                trigger_price=bb_lower,
                 metadata={"rsi": rsi_val, "bb_lower": bb_lower, "vol_ratio": vol_ratio},
             )
 
@@ -203,6 +232,7 @@ class MeanReversion:
                 "SELL", conf, close,
                 stop_loss=close + atr_val * 1.5,
                 take_profit=close - atr_val * 3.0,
+                trigger_price=bb_upper,
                 metadata={"rsi": rsi_val, "bb_upper": bb_upper, "vol_ratio": vol_ratio},
             )
 
@@ -236,19 +266,23 @@ class VolatilityBreakout:
 
         if close > sma_20 + atr_val * self.k:
             conf = min(1.0, 0.5 + (close - sma_20) / (atr_val * 6 + 1e-10))
+            trigger = sma_20 + atr_val * self.k
             return StrategySignal(
                 "BUY", conf, close,
                 stop_loss=close - atr_val * 1.5,
                 take_profit=close + atr_val * 3.0,
+                trigger_price=trigger,
                 metadata={"sma_20": sma_20, "atr": atr_val},
             )
 
         if close < sma_20 - atr_val * self.k:
             conf = min(1.0, 0.5 + (sma_20 - close) / (atr_val * 6 + 1e-10))
+            trigger = sma_20 - atr_val * self.k
             return StrategySignal(
                 "SELL", conf, close,
                 stop_loss=close + atr_val * 1.5,
                 take_profit=close - atr_val * 3.0,
+                trigger_price=trigger,
                 metadata={"sma_20": sma_20, "atr": atr_val},
             )
 
@@ -304,6 +338,7 @@ class VolumeDivergence:
                     "BUY", conf, ohlcv["close"].iloc[-1],
                     stop_loss=close - atr_val * 1.5,
                     take_profit=close + atr_val * 3.0,
+                    trigger_price=t2[1],  # Most recent trough price
                     metadata={"divergence": "bullish"},
                 )
 
@@ -322,6 +357,7 @@ class VolumeDivergence:
                     "SELL", conf, ohlcv["close"].iloc[-1],
                     stop_loss=close + atr_val * 1.5,
                     take_profit=close - atr_val * 3.0,
+                    trigger_price=p2[1],  # Most recent peak price
                     metadata={"divergence": "bearish"},
                 )
 

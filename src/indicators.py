@@ -26,8 +26,12 @@ def rsi(close: pd.Series, length: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1.0 / length, adjust=False).mean()
     # Guard against zero and near-zero (floating-point underflow)
     avg_loss = avg_loss.where(avg_loss > 1e-10)
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    # RSI = 100 when avg_loss is NaN (no down days — all gains)
+    rs = avg_gain / avg_loss.fillna(1e-10)
+    rsi_vals = 100.0 - (100.0 / (1.0 + rs))
+    # Fill NaN (from all-up or all-down) → 100 for all-gain, 0 for all-loss
+    rsi_vals = rsi_vals.where(avg_gain > 1e-10, 0.0).where(avg_loss > 1e-10, 100.0)
+    return rsi_vals
 
 
 def macd(
@@ -130,7 +134,7 @@ def compute_all(ohlcv: pd.DataFrame) -> dict[str, pd.Series]:
         "bb_middle": bb_middle,
         "bb_lower": bb_lower,
         "volume_sma_20": sma(volume, 20),
-        "volume_ratio": volume / sma(volume, 20).replace(0, np.nan),
+        "volume_ratio": volume / sma(volume, 20).where(lambda x: x > 1e-8, np.nan),
     }
 
     _warn_insufficient_data(ohlcv)

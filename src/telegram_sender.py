@@ -10,6 +10,27 @@ from src.pipeline.stage_4_confidence import Signal
 logger = logging.getLogger(__name__)
 
 
+def _price_decimals(price: float, symbol: str) -> int:
+    """Determine display decimals matching compute_sl_tp rounding."""
+    upper = symbol.upper()
+    if "JPY" in upper or "KRW" in upper:
+        return 0
+    elif price > 1000:
+        return 2
+    elif price > 1:
+        return 4
+    else:
+        return 6
+
+
+def _price_str(price: float, decimals: int) -> str:
+    """Format a price with appropriate decimals and commas."""
+    if decimals == 0:
+        return f"{price:,.0f}"
+    else:
+        return f"{price:,.{decimals}f}"
+
+
 def _format_signal_block(signal: Signal, include_research: bool = False,
                           track_record: Optional[str] = None) -> str:
     """Format a single signal as a Telegram message block.
@@ -18,13 +39,16 @@ def _format_signal_block(signal: Signal, include_research: bool = False,
     """
     emoji_map = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
     emoji = emoji_map.get(signal.action, "⚪")
-    entry_str = f"${signal.entry_price:,.2f}" if signal.entry_price > 1 else f"${signal.entry_price:.6f}"
+    entry_dec = _price_decimals(signal.entry_price, signal.symbol)
+    entry_str = f"${_price_str(signal.entry_price, entry_dec)}"
+    sl_dec = _price_decimals(signal.stop_loss, signal.symbol)
+    tp_dec = _price_decimals(signal.take_profit, signal.symbol) if signal.take_profit else entry_dec
 
     lines = [
         f"{emoji} {signal.action} — {signal.symbol} {entry_str}",
         f"{signal.strategy} | Conf {signal.confidence*100:.0f}%",
-        f"SL: {signal.stop_loss:,.2f} | TP: {signal.take_profit:,.2f}" if signal.take_profit
-        else f"SL: {signal.stop_loss:,.2f} | TP: N/A",
+        f"SL: ${_price_str(signal.stop_loss, sl_dec)} | TP: ${_price_str(signal.take_profit, tp_dec)}" if signal.take_profit
+        else f"SL: ${_price_str(signal.stop_loss, sl_dec)} | TP: N/A",
     ]
 
     # Track record (when available)
@@ -105,18 +129,17 @@ def format_daily_message(
         )
 
     avg_conf = sum(s.confidence for s in signals) / len(signals)
+    summary = f"📊 {len(signals)}/{pairs_analyzed} pair analyzed | Avg Conf: {avg_conf*100:.0f}%"
+    if win_rate_7d is not None:
+        summary += f" | 7-day win: {win_rate_7d*100:.0f}%"
+
     lines = [
         "📊 SINYAL HARIAN",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"{len(signals)}/{pairs_analyzed} pair menghasilkan sinyal",
-        f"Avg confidence: {avg_conf*100:.0f}%",
+        summary,
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
     ]
-
-    if win_rate_7d is not None:
-        lines.append(f"Win rate 7-hari: {win_rate_7d*100:.0f}%")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("")
 
     for s in signals:
         lines.append(_format_signal_block(s, include_research))
@@ -152,10 +175,13 @@ def send_daily_signals(
     message = format_daily_message(signals, pairs_analyzed, win_rate_7d, include_research)
 
     if len(message) > 4000:
-        # Truncate with warning
+        # Truncate with warning — find last complete signal block
+        original_len = len(message)
         cutoff = message.rfind("\n", 0, 4000)
+        if cutoff <= 0:
+            cutoff = 3900  # Fallback: hard cut (no newline found)
         message = message[:cutoff] + "\n\n... dan sinyal lainnya (pesan terlalu panjang)"
-        logger.warning("Message truncated to %d chars (was %d)", len(message), len(message) + 100)
+        logger.warning("Message truncated to %d chars (was %d)", len(message), original_len)
 
     # Late import — python-telegram-bot is a required dependency
     from telegram import Bot

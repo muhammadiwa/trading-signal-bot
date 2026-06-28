@@ -1,7 +1,7 @@
 """Main pipeline orchestrator — nightly batch runner with scheduling."""
 
-import logging
 import json
+import logging
 import os
 import sys
 import time
@@ -9,6 +9,8 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import pandas as pd
 
 from src.config import load_config, Settings
 from src.db import init_db, get_connection
@@ -24,16 +26,18 @@ STAGES = [
     ("telegram_deliver", "Stage 5: Telegram Delivery"),
 ]
 
-# Critical data sources for health check
+# Health check tiers: critical failures → abort; non-critical → warn + continue
 CRITICAL_SOURCES = {
     "ccxt": "Exchange data (CCXT)",
-    "alternative_me": "Fear & Greed Index (Alternative.me)",
     "telegram": "Telegram bot token",
+}
+NON_CRITICAL_SOURCES = {
+    "alternative_me": "Fear & Greed Index (Alternative.me)",
 }
 
 
 def health_check(config: Settings) -> dict[str, bool]:
-    """Verify critical data sources are reachable before pipeline start.
+    """Verify data sources are reachable before pipeline start.
 
     Returns:
         Dict mapping source name to True (reachable) or False (failed).
@@ -43,7 +47,7 @@ def health_check(config: Settings) -> dict[str, bool]:
     # CCXT check
     try:
         import ccxt
-        exchange = ccxt.binance({"enableRateLimit": True})
+        exchange = ccxt.binance({"enableRateLimit": True, "timeout": 30000})
         exchange.fetch_ticker("BTC/USDT")
         exchange.close()
         results["ccxt"] = True
@@ -67,24 +71,24 @@ def health_check(config: Settings) -> dict[str, bool]:
 
 
 def send_alert(message: str) -> bool:
-    """Send a critical alert to Telegram. Non-blocking, best-effort."""
+    """Send a critical alert to Telegram. Synchronous, best-effort.
+
+    Uses raw HTTP POST (no asyncio) so it works from any thread,
+    including the APScheduler worker.
+    """
     try:
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        if bot_token and chat_id:
-            import asyncio
-            from telegram import Bot
-            async def _send():
-                await Bot(token=bot_token).send_message(chat_id=chat_id, text=f"⚠️ Pipeline Alert\n{message}")
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(_send())
-                else:
-                    loop.run_until_complete(_send())
-            except RuntimeError:
-                asyncio.run(_send())
-            return True
+        if not bot_token or not chat_id:
+            return False
+        import requests
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        resp = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": f"⚠️ Pipeline Alert\n{message}"},
+            timeout=10,
+        )
+        return resp.status_code == 200
     except Exception as e:
         logger.error("Failed to send alert: %s", e)
     return False
@@ -110,20 +114,31 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
     stage_failed = None
     error_summary = None
 
+    # Inter-stage shared state
+    pair_results: dict = {}      # symbol → {best_strategy, best_result, profile}
+    research_results: dict = {}  # symbol → {sentiment, onchain, macro, multiplier}
+    filtered_signals: list = []  # Signals after filter (populated in stage 4)
+
     # Initialize DB
-    conn = init_db()  # Creates tables if not exist, returns ready connection
-    conn.execute(
-        "INSERT INTO run_log (started_at, status) VALUES (?, ?)",
-        (datetime.now(timezone.utc).isoformat(), "running"),
-    )
-    run_log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.commit()
-    conn.close()
+    conn = init_db()
+    try:
+        conn.execute(
+            "INSERT INTO run_log (started_at, status) VALUES (?, ?)",
+            (datetime.now(timezone.utc).isoformat(), "running"),
+        )
+        run_log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
 
     try:
-        # Health check before starting
+        # ── Health check ──────────────────────────────────────────
         hc_results = health_check(config)
-        critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in hc_results.items() if not v]
+        critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in hc_results.items()
+                          if k in CRITICAL_SOURCES and not v]
+        non_critical_failed = [NON_CRITICAL_SOURCES.get(k, k) for k, v in hc_results.items()
+                              if k in NON_CRITICAL_SOURCES and not v]
+
         if critical_failed:
             logger.error("Health check FAILED — skipping pipeline: %s", ", ".join(critical_failed))
             send_alert(f"Pipeline dibatalkan — health check gagal: {', '.join(critical_failed)}")
@@ -132,16 +147,22 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                 "run_id": run_id, "status": status,
                 "pairs_analyzed": 0, "signals_generated": 0, "duration_seconds": 0,
             }
+        if non_critical_failed:
+            logger.warning(
+                "Non-critical sources unavailable: %s — continuing pipeline",
+                ", ".join(non_critical_failed),
+            )
 
-        # Phase 0: Identity resolution — fetch top coins
+        # ── Phase 0: Identity resolution ──────────────────────────
         logger.info("Pipeline %s starting — fetching top %d coins", run_id, config.top_coins_limit)
         symbols = ["BTC-USDT", "ETH-USDT"]  # Placeholder (Epic 2+ will fetch real top coins)
         pairs_analyzed = len(symbols)
 
-        # Stage execution with artifact directories
+        # Pipeline artifact root
         pipeline_dir = Path("data") / "pipeline" / run_id
         pipeline_dir.mkdir(parents=True, exist_ok=True)
 
+        # ── Stage execution ───────────────────────────────────────
         for idx, (stage_key, stage_name) in enumerate(STAGES, 1):
             elapsed = time.monotonic() - start_time
             warning_threshold = (config.runtime_budget_minutes - 5) * 60
@@ -151,6 +172,13 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
             if elapsed > config.runtime_budget_minutes * 60:
                 logger.error("Pipeline timeout — terminating at stage: %s", stage_name)
                 status = "timeout"
+                # Deliver whatever signals we have so far
+                if filtered_signals:
+                    from src.telegram_sender import send_daily_signals
+                    send_daily_signals(filtered_signals, pairs_analyzed, None, include_research=True)
+                    send_alert(f"⏰ Pipeline timeout — {len(filtered_signals)} sinyal dikirim (hasil parsial)")
+                else:
+                    send_alert(f"⏰ Pipeline timeout — tidak ada sinyal tersedia untuk {pairs_analyzed} pair")
                 break
 
             stage_dir = pipeline_dir / f"stage_{idx}_{stage_key}"
@@ -158,21 +186,57 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
 
             try:
                 logger.info("Running %s (artifacts → %s)", stage_name, stage_dir)
-                # Stage implementations
+
+                # ── Stage 1: Data Fetch ───────────────────────────
                 if stage_key == "data_fetch":
                     from src.exchange import fetch_ohlcv
+                    from src.indicators import save_with_indicators
                     for sym in symbols:
-                        fetch_ohlcv(sym, force_refresh=True, max_age_hours=config.freshness_max_hours)
+                        try:
+                            df = fetch_ohlcv(sym, force_refresh=True,
+                                            max_age_hours=config.freshness_max_hours)
+                            # Compute indicators and save OHLCV + indicators in one file
+                            save_with_indicators(df, f"data/ohlcv/{sym}.parquet")
+                            logger.info("Fetched + indicators saved: %s (%d rows)", sym, len(df))
+                        except Exception as e:
+                            logger.error("Data fetch failed for %s: %s", sym, e)
+
+                # ── Stage 2: Profile + Strategy Match ──────────────
                 elif stage_key == "profile_match":
                     from src.indicators import load_with_indicators
                     from src.pipeline.stage_2_profile import find_best_strategy
                     for sym in symbols:
                         try:
                             df = load_with_indicators(f"data/ohlcv/{sym}.parquet")
-                            ind = {k: df[k] for k in df.columns if k not in ("timestamp","open","high","low","close","volume")}
-                            find_best_strategy(df, ind, sym, config.min_win_rate, config.min_sharpe)
+                            indicator_keys = [k for k in df.columns
+                                            if k not in ("timestamp", "open", "high", "low", "close", "volume")]
+                            ind = {k: df[k] for k in indicator_keys}
+                            best_strategy, best_result, all_results = find_best_strategy(
+                                df, ind, sym, config.min_win_rate, config.min_sharpe,
+                                walk_forward_enabled=config.walk_forward_enabled,
+                            )
+                            pair_results[sym] = {
+                                "best_strategy": best_strategy,
+                                "best_result": best_result,
+                                "all_results": all_results,
+                                "ohlcv": df,
+                                "indicators": ind,
+                            }
                         except Exception:
-                            logger.warning("Profile match failed for %s", sym)
+                            logger.warning("Profile match failed for %s", sym, exc_info=True)
+
+                    # Write stage artifact
+                    stage_summary = {
+                        sym: {
+                            "strategy": pr["best_strategy"].name if pr["best_strategy"] else None,
+                            "win_rate": pr["best_result"].win_rate if pr["best_result"] else None,
+                            "passed": pr["best_result"].passed if pr["best_result"] else False,
+                        }
+                        for sym, pr in pair_results.items()
+                    }
+                    (stage_dir / "profile_match.json").write_text(json.dumps(stage_summary, indent=2))
+
+                # ── Stage 3: Research Context ──────────────────────
                 elif stage_key == "research_context":
                     from src.research import (
                         fetch_sentiment_composite, fetch_whale_transactions,
@@ -181,15 +245,15 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                         polymarket_prediction_adjustment, polymarket_is_fresh,
                     )
                     from src.research_scoring import (
-                        compute_research_multiplier, apply_research_to_confidence,
+                        compute_research_multiplier,
                         sentiment_mult, onchain_mult,
                     )
+
                     sentiment = fetch_sentiment_composite()
                     whale = fetch_whale_transactions()
                     polymarket = fetch_polymarket()
                     poly_fresh = polymarket_is_fresh()
 
-                    # Check if all research sources failed
                     all_down = (
                         sentiment.get("active_sources", 0) == 0 and
                         whale is None and
@@ -203,10 +267,9 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                         active_addr = fetch_coingecko_active_addresses(sym)
                         onchain_signal, _ = compute_onchain(whale, active_addr, sym)
                         has_macro, macro_pen, macro_warning = macro_flag_for_date()
-                        # Prediction adjustment (reduced if stale per AC4)
                         pred_adj = polymarket_prediction_adjustment(sym, polymarket)
                         if not poly_fresh and polymarket is not None:
-                            pred_adj = pred_adj * 0.5  # Reduce weight when stale
+                            pred_adj = pred_adj * 0.5
                             logger.info("Polymarket stale — prediction adj reduced to %+.2f", pred_adj)
                         multiplier = compute_research_multiplier(
                             sentiment_score=sentiment.get("composite"),
@@ -215,7 +278,6 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                             macro_penalty=macro_pen,
                             prediction_adjustment=pred_adj,
                         )
-                        # Store for downstream stages
                         research_results[sym] = {
                             "sentiment_score": sentiment.get("composite"),
                             "sentiment_mult": sentiment_mult(sentiment.get("composite")),
@@ -231,48 +293,94 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                             sym, sentiment.get("composite", 50), onchain_signal,
                             "yes" if has_macro else "no", multiplier,
                         )
+
+                    # Write stage artifact
+                    (stage_dir / "research_context.json").write_text(
+                        json.dumps({sym: {k: str(v) if isinstance(v, float) else v
+                                          for k, v in rr.items()}
+                                    for sym, rr in research_results.items()}, indent=2))
+
+                # ── Stage 4: Confidence + Filter ───────────────────
                 elif stage_key == "confidence_filter":
-                    import json
                     from src.pipeline.stage_4_confidence import (
-                        generate_signal, filter_signals, save_signals, Signal,
+                        generate_signal, filter_signals, save_signals,
                     )
                     signals_list = []
+
                     for sym in symbols:
+                        pr = pair_results.get(sym)
                         rr = research_results.get(sym, {})
-                        s = Signal(
-                            id=f"sig-{sym}-{datetime.now(timezone.utc).strftime('%H%M%S')}",
-                            symbol=sym, action="HOLD", confidence=0.55,
-                            entry_price=50000, stop_loss=49000, take_profit=52000,
-                            strategy="pipeline",
-                            timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                            sentiment_score=rr.get("sentiment_score"),
-                            onchain_signal=rr.get("onchain_signal"),
-                            macro_flag=rr.get("macro_flag", False),
-                            research_metadata=json.dumps(rr) if rr else None,
+                        if pr is None or pr["best_strategy"] is None:
+                            logger.info("%s: no strategy passed — skipping signal generation", sym)
+                            continue
+
+                        strategy = pr["best_strategy"]
+                        best_result = pr["best_result"]
+                        indicators = pr["indicators"]
+                        ohlcv_df = pr["ohlcv"]
+                        entry_price = float(ohlcv_df["close"].iloc[-1])
+                        atr_val = float(indicators.get("atr_14", pd.Series([0])).iloc[-1])
+
+                        try:
+                            strategy_signal = strategy.evaluate(ohlcv_df, indicators)
+                        except Exception as e:
+                            logger.warning("%s strategy eval failed: %s", sym, e)
+                            continue
+
+                        if strategy_signal.action == "HOLD":
+                            continue
+
+                        signal = generate_signal(
+                            symbol=sym,
+                            action=strategy_signal.action,
+                            entry_price=entry_price,
+                            atr_14=atr_val if not pd.isna(atr_val) else 0.0,
+                            strategy_signal=strategy_signal,
+                            backtest_result=best_result,
+                            sl_mult=config.atr_sl_multiplier,
+                            tp_mult=config.atr_tp_multiplier,
                         )
-                        signals_list.append(s)
-                    filtered = filter_signals(signals_list, config.min_confidence, config.max_signals_per_day)
-                    signals_generated = save_signals(filtered)
-                    logger.info("Confidence filter: %d signals, %d passed", len(signals_list), signals_generated)
+
+                        # Attach research metadata
+                        signal.sentiment_score = rr.get("sentiment_score")
+                        signal.onchain_signal = rr.get("onchain_signal")
+                        signal.macro_flag = rr.get("macro_flag", False)
+                        signal.research_metadata = json.dumps(rr) if rr else None
+
+                        signals_list.append(signal)
+
+                    # Filter + save
+                    filtered_signals = filter_signals(
+                        signals_list,
+                        config.min_confidence,
+                        config.max_signals_per_day,
+                        cooldown_hours=config.cooldown_hours,
+                        cooldown_override=config.cooldown_override_confidence,
+                    )
+                    signals_generated = save_signals(filtered_signals)
+                    logger.info("Confidence filter: %d generated, %d passed, %d saved",
+                                len(signals_list), len(filtered_signals), signals_generated)
+
+                    # Write stage artifact
+                    (stage_dir / "signals.json").write_text(json.dumps(
+                        [{"id": s.id, "symbol": s.symbol, "action": s.action,
+                          "confidence": s.confidence, "entry_price": s.entry_price,
+                          "strategy": s.strategy}
+                         for s in filtered_signals], indent=2))
+
+                # ── Stage 5: Telegram Delivery ─────────────────────
                 elif stage_key == "telegram_deliver":
-                    from src.telegram_sender import send_daily_signals, format_daily_message
-                    signals_list = []
-                    for sym in symbols:
-                        from src.pipeline.stage_4_confidence import Signal
-                        rr = research_results.get(sym, {})
-                        s = Signal(
-                            id=f"sig-{sym}", symbol=sym,
-                            action="BUY" if rr.get("final_multiplier", 1.0) > 1.0 else "SELL",
-                            confidence=0.65, entry_price=50000, stop_loss=49000,
-                            take_profit=52000, strategy="pipeline",
-                            timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                            sentiment_score=rr.get("sentiment_score"),
-                            onchain_signal=rr.get("onchain_signal"),
-                            macro_flag=rr.get("macro_flag", False),
-                            research_metadata=json.dumps(rr) if rr else None,
-                        )
-                        signals_list.append(s)
-                    send_daily_signals(signals_list, pairs_analyzed, None, include_research=True)
+                    from src.telegram_sender import send_daily_signals
+
+                    if not filtered_signals:
+                        logger.warning("No filtered signals available — sending empty report")
+                    success = send_daily_signals(
+                        filtered_signals, pairs_analyzed, None,
+                        include_research=True,
+                    )
+                    if not success:
+                        logger.error("Telegram delivery failed — signals saved to DB only")
+
             except Exception as e:
                 logger.error("%s failed: %s", stage_name, e, exc_info=True)
                 stage_failed = idx
@@ -312,7 +420,7 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
         if status == "completed":
             send_alert(f"✅ Pipeline selesai — {pairs_analyzed} pair dianalisa, {signals_generated} sinyal dalam {duration:.0f}s")
         elif status == "timeout":
-            send_alert(f"⏰ Pipeline timeout — hasil parsial tersedia ({pairs_analyzed} pair)")
+            send_alert(f"⏰ Pipeline timeout — hasil parsial dikirim ({pairs_analyzed} pair, {signals_generated} sinyal)")
 
         logger.info("Pipeline %s finished: status=%s duration=%.0fs", run_id, status, duration)
 
@@ -347,12 +455,18 @@ def start_scheduler():
 
     # Run health check on startup
     results = health_check(config)
-    failed = [CRITICAL_SOURCES.get(k, k) for k, v in results.items() if not v]
-    if failed:
-        logger.error("Health check FAILED: %s", ", ".join(failed))
-        send_alert(f"Health check gagal: {', '.join(failed)}")
+    critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in results.items()
+                      if k in CRITICAL_SOURCES and not v]
+    non_critical_failed = [NON_CRITICAL_SOURCES.get(k, k) for k, v in results.items()
+                          if k in NON_CRITICAL_SOURCES and not v]
+    if critical_failed:
+        logger.error("Health check FAILED: %s", ", ".join(critical_failed))
+        send_alert(f"Health check gagal: {', '.join(critical_failed)}")
     else:
-        logger.info("Health check passed — all critical sources reachable")
+        status_msg = "all sources reachable"
+        if non_critical_failed:
+            status_msg += f" (non-critical down: {', '.join(non_critical_failed)})"
+        logger.info("Health check passed — %s", status_msg)
 
     return scheduler
 
@@ -364,5 +478,6 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger.info("Trading Signal Pipeline starting...")
-    init_db()  # Ensure tables exist before pipeline runs
+    # init_db only once to ensure tables exist; run_pipeline calls its own init
+    init_db().close()
     run_pipeline()
