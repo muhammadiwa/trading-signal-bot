@@ -38,6 +38,16 @@ def _format_signal_block(signal: Signal, include_research: bool = False,
         lines.append(f"🔗 On-chain: {signal.onchain_signal}")
     if include_research and signal.macro_flag:
         lines.append("📅 Macro event nearby ⚠️")
+    if include_research and signal.research_metadata:
+        import json
+        try:
+            meta = json.loads(signal.research_metadata)
+            mult = meta.get("final_multiplier")
+            if mult is not None and mult != 1.0:
+                direction = "boost" if mult > 1.0 else "reduce"
+                lines.append(f"🔬 Research: {direction} {abs(mult-1.0)*100:.0f}%")
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     return "\n".join(lines)
 

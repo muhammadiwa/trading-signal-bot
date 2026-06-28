@@ -1,6 +1,7 @@
 """Main pipeline orchestrator — nightly batch runner with scheduling."""
 
 import logging
+import json
 import os
 import sys
 import time
@@ -254,8 +255,24 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                     signals_generated = save_signals(filtered)
                     logger.info("Confidence filter: %d signals, %d passed", len(signals_list), signals_generated)
                 elif stage_key == "telegram_deliver":
-                    from src.telegram_sender import send_daily_signals
-                    send_daily_signals([], pairs_analyzed, 0.0)
+                    from src.telegram_sender import send_daily_signals, format_daily_message
+                    signals_list = []
+                    for sym in symbols:
+                        from src.pipeline.stage_4_confidence import Signal
+                        rr = research_results.get(sym, {})
+                        s = Signal(
+                            id=f"sig-{sym}", symbol=sym,
+                            action="BUY" if rr.get("final_multiplier", 1.0) > 1.0 else "SELL",
+                            confidence=0.65, entry_price=50000, stop_loss=49000,
+                            take_profit=52000, strategy="pipeline",
+                            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                            sentiment_score=rr.get("sentiment_score"),
+                            onchain_signal=rr.get("onchain_signal"),
+                            macro_flag=rr.get("macro_flag", False),
+                            research_metadata=json.dumps(rr) if rr else None,
+                        )
+                        signals_list.append(s)
+                    send_daily_signals(signals_list, pairs_analyzed, None, include_research=True)
             except Exception as e:
                 logger.error("%s failed: %s", stage_name, e, exc_info=True)
                 stage_failed = idx
