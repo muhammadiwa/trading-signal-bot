@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS signals (
     macro_flag INTEGER DEFAULT 0,
     research_metadata TEXT,
     timestamp_utc TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'resolved'))
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'resolved', 'unresolvable'))
 );
 
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS run_log (
     duration_seconds REAL,
     status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed', 'timeout', 'aborted')),
     stage_failed INTEGER,
-    error_summary TEXT
+    error_summary TEXT,
+    win_rate_7d REAL
 );
 
 CREATE TABLE IF NOT EXISTS weights (
@@ -56,6 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
 CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp_utc);
 CREATE INDEX IF NOT EXISTS idx_outcomes_signal ON outcomes(signal_id);
+CREATE INDEX IF NOT EXISTS idx_outcomes_resolved_at ON outcomes(resolved_at);
 CREATE INDEX IF NOT EXISTS idx_run_log_started ON run_log(started_at);
 """
 

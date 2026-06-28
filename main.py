@@ -117,6 +117,7 @@ def fetch_top_symbols(config: Settings) -> list[str]:
 
 def run_pipeline(config: Optional[Settings] = None) -> dict:
     """Execute the full multi-timeframe nightly pipeline."""
+    global _win_rate_7d_cache
     if config is None:
         config = load_config()
 

@@ -22,12 +22,14 @@ def compute_return(action: str, entry_price: float, current_price: float) -> flo
     Returns:
         Float percentage (e.g., +2.82 means +2.82%).
     """
+    if entry_price <= 0:
+        raise ValueError(f"Invalid entry_price {entry_price} for signal")
     if action == "BUY":
         return (current_price - entry_price) / entry_price * 100
     elif action == "SELL":
         return (entry_price - current_price) / entry_price * 100
     else:
-        return 0.0
+        raise ValueError(f"Unknown action '{action}' — expected BUY or SELL")
 
 
 def _fetch_current_price(symbol: str) -> float:
@@ -46,15 +48,18 @@ def _fetch_current_price(symbol: str) -> float:
     for exchange_id in ("binance", "okx"):
         try:
             exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True, "timeout": 15000})
-            try:
-                ticker = exchange.fetch_ticker(normalized)
-                price = ticker.get("last") or ticker.get("close")
-                if price and price > 0:
-                    return float(price)
-            finally:
-                if hasattr(exchange, "close"):
-                    exchange.close()
+            ticker = exchange.fetch_ticker(normalized)
+            price = ticker.get("last") or ticker.get("close")
+            exchange.close()
+            if price and price > 0:
+                return float(price)
         except Exception:
+            # Suppress close-time errors; original fetch error is what matters
+            try:
+                if 'exchange' in locals() and hasattr(exchange, "close"):
+                    exchange.close()
+            except Exception:
+                pass
             continue
 
     raise RuntimeError(f"Symbol {symbol} no longer available")
@@ -75,102 +80,102 @@ def resolve_pending_signals() -> list[dict]:
     from src.db import get_connection
 
     conn = get_connection()
+    try:
+        # Step 1: Get all pending signals
+        rows = conn.execute(
+            """SELECT id, symbol, action, entry_price, timestamp_utc
+               FROM signals WHERE status = 'pending'
+               ORDER BY timestamp_utc""",
+        ).fetchall()
 
-    # Step 1: Get all pending signals
-    rows = conn.execute(
-        """SELECT id, symbol, action, entry_price, timestamp_utc
-           FROM signals WHERE status = 'pending'
-           ORDER BY timestamp_utc""",
-    ).fetchall()
+        if not rows:
+            logger.info("No pending signals to resolve")
+            return []
 
-    if not rows:
-        logger.info("No pending signals to resolve")
-        conn.close()
-        return []
+        logger.info("Resolving %d pending signals...", len(rows))
 
-    logger.info("Resolving %d pending signals...", len(rows))
+        # Step 2: Deduplicate symbols — fetch price once per unique symbol
+        unique_symbols = list(dict.fromkeys(r["symbol"] for r in rows))
+        prices: dict[str, float | None] = {}
+        errors: dict[str, str] = {}
 
-    # Step 2: Deduplicate symbols — fetch price once per unique symbol
-    unique_symbols = list(dict.fromkeys(r["symbol"] for r in rows))  # Ordered, unique
-    prices: dict[str, float | None] = {}
-    errors: dict[str, str] = {}
+        for sym in unique_symbols:
+            try:
+                prices[sym] = _fetch_current_price(sym)
+            except Exception as e:
+                logger.warning("Symbol %s no longer available: %s", sym, e)
+                prices[sym] = None
+                errors[sym] = f"Symbol {sym} no longer available"
 
-    for sym in unique_symbols:
-        try:
-            prices[sym] = _fetch_current_price(sym)
-        except Exception as e:
-            logger.warning("Symbol %s no longer available: %s", sym, e)
-            prices[sym] = None
-            errors[sym] = f"Symbol {sym} no longer available"
+        # Step 3-4: Compute returns + write outcomes
+        resolved_at = datetime.now(timezone.utc).isoformat()
+        results = []
 
-    # Step 3-4: Compute returns + write outcomes
-    resolved_at = datetime.now(timezone.utc).isoformat()
-    results = []
+        for row in rows:
+            sym = row["symbol"]
+            current_price = prices.get(sym)
+            signal_id = row["id"]
 
-    for row in rows:
-        sym = row["symbol"]
-        current_price = prices.get(sym)
-        signal_id = row["id"]
+            if current_price is None:
+                # AC5: Unresolvable — delisted or unreachable
+                conn.execute(
+                    """INSERT OR IGNORE INTO outcomes
+                       (signal_id, realized_return_pct, price_at_resolution, resolved_at)
+                       VALUES (?, NULL, NULL, ?)""",
+                    (signal_id, resolved_at),
+                )
+                conn.execute(
+                    "UPDATE signals SET status = 'unresolvable' WHERE id = ?",
+                    (signal_id,),
+                )
+                result = {
+                    "signal_id": signal_id, "symbol": sym,
+                    "realized_return_pct": None,
+                    "price_at_resolution": None,
+                    "win": False, "error": errors.get(sym, "Unresolvable"),
+                }
+            else:
+                # AC1+AC2: Resolve normally
+                ret_pct = compute_return(row["action"], row["entry_price"], current_price)
+                win = ret_pct > 0
 
-        if current_price is None:
-            # AC5: Unresolvable — delisted or unreachable
-            conn.execute(
-                """INSERT OR IGNORE INTO outcomes
-                   (signal_id, realized_return_pct, price_at_resolution, resolved_at)
-                   VALUES (?, NULL, NULL, ?)""",
-                (signal_id, resolved_at),
+                conn.execute(
+                    """INSERT OR IGNORE INTO outcomes
+                       (signal_id, realized_return_pct, price_at_resolution, resolved_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (signal_id, round(ret_pct, 4), current_price, resolved_at),
+                )
+                conn.execute(
+                    "UPDATE signals SET status = 'resolved' WHERE id = ?",
+                    (signal_id,),
+                )
+                result = {
+                    "signal_id": signal_id, "symbol": sym,
+                    "realized_return_pct": round(ret_pct, 4),
+                    "price_at_resolution": current_price,
+                    "win": win, "error": None,
+                }
+
+            results.append(result)
+            logger.debug(
+                "%s %s: entry=%.2f current=%s return=%s%%",
+                sym, row["action"], row["entry_price"],
+                current_price, result["realized_return_pct"],
             )
-            conn.execute(
-                "UPDATE signals SET status = 'unresolvable' WHERE id = ?",
-                (signal_id,),
-            )
-            result = {
-                "signal_id": signal_id, "symbol": sym,
-                "realized_return_pct": None,
-                "price_at_resolution": None,
-                "win": False, "error": errors.get(sym, "Unresolvable"),
-            }
-        else:
-            # AC1+AC2: Resolve normally
-            ret_pct = compute_return(row["action"], row["entry_price"], current_price)
-            win = ret_pct > 0
 
-            conn.execute(
-                """INSERT OR IGNORE INTO outcomes
-                   (signal_id, realized_return_pct, price_at_resolution, resolved_at)
-                   VALUES (?, ?, ?, ?)""",
-                (signal_id, round(ret_pct, 4), current_price, resolved_at),
-            )
-            conn.execute(
-                "UPDATE signals SET status = 'resolved' WHERE id = ?",
-                (signal_id,),
-            )
-            result = {
-                "signal_id": signal_id, "symbol": sym,
-                "realized_return_pct": round(ret_pct, 4),
-                "price_at_resolution": current_price,
-                "win": win, "error": None,
-            }
+        conn.commit()
 
-        results.append(result)
-        logger.debug(
-            "%s %s: entry=%.2f current=%s return=%s%%",
-            sym, row["action"], row["entry_price"],
-            current_price, result["realized_return_pct"],
+        wins = sum(1 for r in results if r["win"])
+        logger.info(
+            "Outcomes resolved: %d total, %d wins, %d losses, %d unresolvable",
+            len(results), wins,
+            sum(1 for r in results if r["realized_return_pct"] is not None and r["realized_return_pct"] <= 0),
+            sum(1 for r in results if r["realized_return_pct"] is None),
         )
 
-    conn.commit()
-    conn.close()
-
-    wins = sum(1 for r in results if r["win"])
-    logger.info(
-        "Outcomes resolved: %d total, %d wins, %d losses, %d unresolvable",
-        len(results), wins,
-        sum(1 for r in results if r["realized_return_pct"] is not None and r["realized_return_pct"] <= 0),
-        sum(1 for r in results if r["realized_return_pct"] is None),
-    )
-
-    return results
+        return results
+    finally:
+        conn.close()
 
 
 def _compute_win_rate_7d() -> Optional[float]:
