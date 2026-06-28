@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 # Sentiment keywords for Reddit title analysis
 BULLISH_WORDS = {"buy", "bullish", "long", "moon", "pump", "green", "breakout",
-                 "rally", "surge", "up", "gain", "ath"}
+                 "rally", "surge", "up", "gain", "ath", "bull", "approve", "etf"}
+BEARISH_WORDS = {"sell", "bearish", "short", "dump", "red", "crash", "correction",
+                 "drop", "down", "loss", "fear", "liquidat", "blood", "ban", "reject"}
 BEARISH_WORDS = {"sell", "bearish", "short", "dump", "red", "crash", "correction",
                  "drop", "down", "loss", "fear", "liquidat", "blood"}
 REDDIT_SUBREDDITS = ["CryptoCurrency", "bitcoin"]
@@ -66,7 +68,7 @@ def _parse_reddit_feed(rss_text: str) -> tuple[int, int, int]:
             title_el = entry.find("atom:title", ns)
             if title_el is not None and title_el.text:
                 words = set(re.findall(r'\w+', title_el.text.lower()))
-                if words & BULLISH_WORDS or "all time high" in title_el.text.lower():
+                if words & BULLISH_WORDS:
                     bullish += 1
                 elif words & BEARISH_WORDS:
                     bearish += 1
@@ -109,6 +111,9 @@ def fetch_reddit_sentiment() -> Optional[dict]:
             )
             try:
                 resp = requests.get(url, timeout=15, headers={"User-Agent": REDDIT_USER_AGENT})
+                if resp.status_code == 429:
+                    logger.warning("Reddit rate-limited (429) — quota may be exhausted for %s/%s", subreddit, keyword)
+                    continue
                 if resp.status_code != 200:
                     continue
                 b, s, t = _parse_reddit_feed(resp.text)
@@ -220,22 +225,28 @@ def fetch_whale_transactions(min_value_usd: int = 1_000_000) -> Optional[dict]:
 
     since_ts = int((time.time() - 86400))  # 24 hours ago
 
-    try:
-        resp = requests.get(
-            "https://api.whale-alert.io/v1/transactions",
-            params={
-                "api_key": WHALE_ALERT_API_KEY,
-                "min_value": min_value_usd,
-                "start": since_ts,
-                "limit": 100,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        txs = resp.json().get("transactions", [])
-    except Exception as e:
-        logger.warning("Whale Alert unavailable — on-chain signal skipped: %s", e)
-        return None
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                "https://api.whale-alert.io/v1/transactions",
+                params={
+                    "api_key": WHALE_ALERT_API_KEY,
+                    "min_value": min_value_usd,
+                    "start": since_ts,
+                    "limit": 100,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            txs = resp.json().get("transactions", [])
+            break  # Success — exit retry loop
+        except Exception as e:
+            if attempt < 2:
+                logger.warning("Whale Alert attempt %d/3 failed: %s — retrying", attempt + 1, e)
+                time.sleep(2 ** attempt)
+            else:
+                logger.warning("Whale Alert unavailable after 3 attempts — on-chain signal skipped: %s", e)
+                return None
 
     if not txs:
         return None
@@ -283,7 +294,8 @@ def fetch_whale_transactions(min_value_usd: int = 1_000_000) -> Optional[dict]:
         "buy_count": buy_count, "sell_count": sell_count,
         "buy_volume": buy_volume, "sell_volume": sell_volume,
         "total_count": buy_count + sell_count,
-        # AC1: inflow is money going TO exchanges (bearish), outflow is FROM (bullish)
+        # AC1: outflow (from exchanges = buy) is bullish, inflow (to exchanges = sell) is bearish
+        # Positive net_flow = net outflow = more buying from exchanges → bullish
         "net_flow": buy_volume - sell_volume,
     }
 
@@ -556,6 +568,9 @@ def fetch_polymarket(category: str = "crypto", limit: int = 20) -> Optional[list
         markets = resp.json()
     except Exception as e:
         logger.warning("Polymarket API unavailable — prediction markets skipped: %s", e)
+        # Invalidate cache on failure — stale data must not report as fresh
+        global _polymarket_last_fetch
+        _polymarket_last_fetch = None
         return None
 
     if not markets:
