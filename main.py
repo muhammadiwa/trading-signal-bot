@@ -147,7 +147,12 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
 
     try:
         # ── Health check ──────────────────────────────────────────
-        hc = health_check(config)
+        skip_health = os.getenv("SKIP_HEALTH_CHECK", "").lower() in ("1", "true", "yes")
+        if skip_health:
+            logger.warning("SKIP_HEALTH_CHECK set — bypassing health checks")
+            hc = {"ccxt": True, "alternative_me": True, "telegram": True}
+        else:
+            hc = health_check(config)
         critical_failed = [CRITICAL_SOURCES.get(k, k) for k, v in hc.items()
                           if k in CRITICAL_SOURCES and not v]
         non_critical_failed = [NON_CRITICAL_SOURCES.get(k, k) for k, v in hc.items()
