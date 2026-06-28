@@ -41,7 +41,17 @@ def _format_signal_block(signal: Signal, include_research: bool = False,
     else:
         meta = {}
 
-    if include_research and signal.sentiment_score is not None:
+    # Check if all research sources defaulted (AC4)
+    all_unavailable = (
+        signal.sentiment_score is None and
+        not signal.onchain_signal and
+        not signal.macro_flag and
+        not meta.get("prediction_adjustment", 0)
+    )
+
+    if include_research and all_unavailable:
+        lines.append("(Technical confidence only — research data unavailable)")
+    elif include_research:
         fg_val = signal.sentiment_score
         classification = "Fear" if fg_val < 40 else ("Greed" if fg_val > 60 else "Neutral")
         lines.append(f"📊 Sentiment: {classification} {fg_val:.0f}/100")
