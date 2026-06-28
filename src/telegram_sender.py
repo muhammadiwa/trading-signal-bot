@@ -65,18 +65,19 @@ def _format_signal_block(signal: Signal, include_research: bool = False,
     else:
         meta = {}
 
-    # Check if all research sources defaulted (AC4)
-    all_unavailable = (
-        signal.sentiment_score is None and
-        not signal.onchain_signal and
-        not signal.macro_flag and
-        not meta.get("prediction_adjustment", 0)
+    # Check if all research sources defaulted (Story 2.5 AC5 + Story 2.6 AC4)
+    # Use explicit flag from research pipeline rather than heuristic
+    research_unavailable = meta.get("research_unavailable", False)
+    all_defaulted = (
+        research_unavailable or
+        (signal.sentiment_score is None and not signal.onchain_signal
+         and not signal.macro_flag)
     )
 
-    if include_research and all_unavailable:
+    if include_research and all_defaulted:
         lines.append("(Technical confidence only — research data unavailable)")
     elif include_research:
-        fg_val = signal.sentiment_score
+        fg_val = signal.sentiment_score if signal.sentiment_score is not None else 50.0
         classification = "Fear" if fg_val < 40 else ("Greed" if fg_val > 60 else "Neutral")
         lines.append(f"📊 Sentiment: {classification} {fg_val:.0f}/100")
     if include_research and signal.onchain_signal:
