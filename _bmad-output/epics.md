@@ -27,7 +27,7 @@ FR2.1: Compute 4D profile per pair: trendiness (ADX), volatility (ATR/close), me
 
 FR2.2: Implement 5 strategies: Momentum Breakout, Trend Following, Mean Reversion, Volatility Breakout, Volume-Price Divergence.
 
-FR2.3: Match profile to strategy via deterministic rules. Unclear profile → ensemble voting (all 5).
+FR2.3: Match profile to strategy via deterministic rules. Unclear profile → try all strategies in priority order.
 
 FR2.4: Backtest matched strategy on 6-month data. Gate: win rate ≥ 40%, Sharpe ≥ 0.5. Fail → next strategy or drop.
 
@@ -165,7 +165,7 @@ So that all subsequent stories have a solid foundation to build upon.
 **Given** a fresh checkout of the repository
 **When** I run `pip install -r requirements.txt`
 **Then** all dependencies install without errors
-**And** `python -c "import ccxt, pandas, pandas_ta, pyarrow, requests, telegram, apscheduler; print('OK')"` succeeds
+**And** `python -c "import ccxt, numpy, pandas, pyarrow, requests, telegram, apscheduler, yaml; print('OK')"` succeeds
 
 **Given** the project directory exists
 **When** I create `config/settings.yaml` with watchlist, thresholds, and API endpoints
@@ -327,7 +327,7 @@ So that each pair uses the strategy most suited to its characteristics.
 
 **Given** a PairProfile with no clear dominant characteristic
 **When** the matcher runs
-**Then** selects Ensemble mode (all 5 strategies vote)
+**Then** selects Ensemble mode (try all strategies in priority order)
 **And** logs: "Unclear profile for {symbol} — using ensemble"
 
 **Given** a matched strategy
