@@ -176,22 +176,31 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                     from src.research import (
                         fetch_sentiment_composite, fetch_whale_transactions,
                         fetch_coingecko_active_addresses, compute_onchain,
-                        macro_flag_for_date,
+                        macro_flag_for_date, fetch_polymarket,
+                        polymarket_prediction_adjustment, polymarket_is_fresh,
                     )
                     from src.research_scoring import (
                         compute_research_multiplier, apply_research_to_confidence,
                     )
                     sentiment = fetch_sentiment_composite()
                     whale = fetch_whale_transactions()
+                    polymarket = fetch_polymarket()
+                    poly_fresh = polymarket_is_fresh()
                     for sym in symbols:
                         active_addr = fetch_coingecko_active_addresses(sym)
                         onchain_signal, _ = compute_onchain(whale, active_addr, sym)
                         has_macro, macro_pen, macro_warning = macro_flag_for_date()
+                        # Prediction adjustment (reduced if stale per AC4)
+                        pred_adj = polymarket_prediction_adjustment(sym, polymarket)
+                        if not poly_fresh and polymarket is not None:
+                            pred_adj = pred_adj * 0.5  # Reduce weight when stale
+                            logger.info("Polymarket stale — prediction adj reduced to %+.2f", pred_adj)
                         multiplier = compute_research_multiplier(
                             sentiment_score=sentiment.get("composite"),
                             onchain_signal=onchain_signal,
                             macro_has_event=has_macro,
                             macro_penalty=macro_pen,
+                            prediction_adjustment=pred_adj,
                         )
                         # Store for downstream stages
                         research_results[sym] = {
@@ -200,6 +209,7 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                             "macro_flag": has_macro,
                             "macro_penalty": macro_pen,
                             "multiplier": multiplier,
+                            "prediction_adjustment": pred_adj,
                         }
                         logger.info(
                             "Research %s: sentiment=%.0f onchain=%s macro=%s → multiplier=%.2f",

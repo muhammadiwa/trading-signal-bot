@@ -600,4 +600,7 @@ def polymarket_is_fresh(max_age_hours: int = 12) -> bool:
     """Check if cached Polymarket data is fresh (≤12 hours old per AC)."""
     if _polymarket_last_fetch is None:
         return False
-    return (time.time() - _polymarket_last_fetch) < max_age_hours * 3600
+    fresh = (time.time() - _polymarket_last_fetch) < max_age_hours * 3600
+    if not fresh:
+        logger.warning("Polymarket data stale (>%dh) — reducing prediction weight", max_age_hours)
+    return fresh
