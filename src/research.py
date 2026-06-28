@@ -7,9 +7,11 @@ Auto-normalizes weights when sources are missing. Never crashes — returns neut
 import logging
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
-
 import requests
 
 logger = logging.getLogger(__name__)
@@ -386,3 +388,100 @@ def compute_onchain(whale_data: Optional[dict],
         return "bearish", 0.85
     else:
         return "neutral", 1.0
+
+
+# ============================================================
+# Story 2.3: Macro Calendar Overlay (FR1.4)
+# ============================================================
+
+def load_macro_calendar() -> list[dict]:
+    """Load macro event calendar from config/macro_calendar.json.
+
+    Returns list of event dicts: {date, event, impact}.
+    Returns empty list if file missing or unparseable.
+    """
+    calendar_path = Path(__file__).resolve().parent.parent / "config" / "macro_calendar.json"
+    if not calendar_path.exists():
+        logger.warning("Macro calendar file not found at %s — macro overlay disabled", calendar_path)
+        return []
+
+    try:
+        import json
+        with open(calendar_path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            logger.error("Macro calendar JSON must be a list, got %s — ignoring", type(data).__name__)
+            return []
+        # Validate each entry
+        valid = []
+        for i, entry in enumerate(data):
+            if not isinstance(entry, dict):
+                logger.warning("Macro calendar entry %d is not a dict — skipping", i)
+                continue
+            if "date" not in entry or "event" not in entry:
+                logger.warning("Macro calendar entry %d missing date/event — skipping", i)
+                continue
+            valid.append(entry)
+        return valid
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Macro calendar JSON parse error: %s — macro overlay disabled", e)
+        return []
+
+
+def get_upcoming_macro_events(days_ahead: int = 7) -> list[dict]:
+    """Get macro events within the next N days, sorted by date."""
+    calendar = load_macro_calendar()
+    if not calendar:
+        return []
+
+    today = datetime.now(timezone.utc).date()
+    cutoff = today + timedelta(days=days_ahead)
+    upcoming = []
+    for ev in calendar:
+        try:
+            ev_date = datetime.strptime(ev["date"], "%Y-%m-%d").date()
+            if today <= ev_date <= cutoff:
+                upcoming.append(ev)
+        except (ValueError, KeyError):
+            continue
+    return sorted(upcoming, key=lambda e: e["date"])
+
+
+def macro_flag_for_date(target_date: Optional[datetime] = None,
+                        look_ahead_days: int = 7) -> tuple[bool, float, Optional[str]]:
+    """Check for macro events near target date.
+
+    Returns (has_event: bool, penalty: float, warning: str|None):
+      - High impact ≤24h → penalty 0.20, warning with event name
+      - High impact ≤48h → penalty 0.10
+      - Medium impact → half of high-impact penalty
+      - No event → (False, 0.0, None)
+    """
+    if target_date is None:
+        target_date = datetime.now(timezone.utc)
+
+    events = get_upcoming_macro_events(look_ahead_days)
+    if not events:
+        return False, 0.0, None
+
+    for ev in events:
+        try:
+            ev_date = datetime.strptime(ev["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            hours_away = (ev_date - target_date).total_seconds() / 3600
+            if hours_away < 0:
+                continue  # Past event
+            impact = ev.get("impact", "medium")
+            event_name = ev.get("event", "Unknown")
+
+            if hours_away <= 24:
+                penalty = 0.20 if impact == "high" else 0.10
+                warning = f"{event_name} in {hours_away:.0f}h — elevated volatility expected"
+                return True, penalty, warning
+            elif hours_away <= 48:
+                penalty = 0.10 if impact == "high" else 0.05
+                warning = f"{event_name} in 2 days — volatility expected"
+                return True, penalty, warning
+        except (ValueError, KeyError):
+            continue
+
+    return False, 0.0, None

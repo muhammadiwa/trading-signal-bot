@@ -1,0 +1,7 @@
+[
+  {"date": "2026-07-01", "event": "FOMC Minutes", "impact": "high"},
+  {"date": "2026-07-10", "event": "CPI Data Release", "impact": "high"},
+  {"date": "2026-07-15", "event": "NFP Report", "impact": "high"},
+  {"date": "2026-07-20", "event": "GDP Q2 Advance", "impact": "medium"},
+  {"date": "2026-07-25", "event": "Fed Rate Decision", "impact": "high"}
+]
