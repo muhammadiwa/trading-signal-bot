@@ -181,11 +181,23 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                     )
                     from src.research_scoring import (
                         compute_research_multiplier, apply_research_to_confidence,
+                        sentiment_mult, onchain_mult,
                     )
                     sentiment = fetch_sentiment_composite()
                     whale = fetch_whale_transactions()
                     polymarket = fetch_polymarket()
                     poly_fresh = polymarket_is_fresh()
+
+                    # Check if all research sources failed
+                    all_down = (
+                        sentiment.get("active_sources", 0) == 0 and
+                        whale is None and
+                        polymarket is None
+                    )
+                    if all_down:
+                        logger.warning("Research data unavailable — using technical confidence only")
+                        send_alert("⚠️ Research data unavailable — signals using technical confidence only")
+
                     for sym in symbols:
                         active_addr = fetch_coingecko_active_addresses(sym)
                         onchain_signal, _ = compute_onchain(whale, active_addr, sym)
@@ -205,10 +217,12 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                         # Store for downstream stages
                         research_results[sym] = {
                             "sentiment_score": sentiment.get("composite"),
+                            "sentiment_mult": sentiment_mult(sentiment.get("composite")),
                             "onchain_signal": onchain_signal,
+                            "onchain_mult": onchain_mult(onchain_signal),
                             "macro_flag": has_macro,
                             "macro_penalty": macro_pen,
-                            "multiplier": multiplier,
+                            "final_multiplier": multiplier,
                             "prediction_adjustment": pred_adj,
                         }
                         logger.info(
@@ -216,6 +230,29 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                             sym, sentiment.get("composite", 50), onchain_signal,
                             "yes" if has_macro else "no", multiplier,
                         )
+                elif stage_key == "confidence_filter":
+                    import json
+                    from src.pipeline.stage_4_confidence import (
+                        generate_signal, filter_signals, save_signals, Signal,
+                    )
+                    signals_list = []
+                    for sym in symbols:
+                        rr = research_results.get(sym, {})
+                        s = Signal(
+                            id=f"sig-{sym}-{datetime.now(timezone.utc).strftime('%H%M%S')}",
+                            symbol=sym, action="HOLD", confidence=0.55,
+                            entry_price=50000, stop_loss=49000, take_profit=52000,
+                            strategy="pipeline",
+                            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                            sentiment_score=rr.get("sentiment_score"),
+                            onchain_signal=rr.get("onchain_signal"),
+                            macro_flag=rr.get("macro_flag", False),
+                            research_metadata=json.dumps(rr) if rr else None,
+                        )
+                        signals_list.append(s)
+                    filtered = filter_signals(signals_list, config.min_confidence, config.max_signals_per_day)
+                    signals_generated = save_signals(filtered)
+                    logger.info("Confidence filter: %d signals, %d passed", len(signals_list), signals_generated)
                 elif stage_key == "telegram_deliver":
                     from src.telegram_sender import send_daily_signals
                     send_daily_signals([], pairs_analyzed, 0.0)

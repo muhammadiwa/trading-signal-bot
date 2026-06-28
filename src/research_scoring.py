@@ -65,6 +65,14 @@ def compute_research_multiplier(
     onch = onchain_mult(onchain_signal)
     macro = macro_penalty if macro_has_event else 0.0
 
+    # Count active sources
+    active = sum(1 for v in [sentiment_score, onchain_signal, macro_has_event] if v is not None)
+    total_sources = 4
+    if active == 0:
+        logger.warning("Research multiplier: 0 of %d sources active — using technical confidence only", total_sources)
+    elif active < total_sources:
+        logger.info("Research multiplier: %d of %d sources active", active, total_sources)
+
     multiplier = sent * onch * (1.0 - macro) + prediction_adjustment
     clamped = max(0.5, min(1.5, multiplier))
 
