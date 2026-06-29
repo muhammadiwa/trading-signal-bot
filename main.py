@@ -312,56 +312,48 @@ def run_pipeline(config: Optional[Settings] = None) -> dict:
                     )
                     signals_list = []
                     for sym in symbols:
-                        pr_result = None
-                        # Multi-timeframe confirmation: prefer 1d → 4h → 1h
+                        rr = research_results.get(sym, {})
+                        # Multi-TF proper: generate signal for EACH timeframe independently
                         for tf in TIME_FRAMES:
                             key = f"{sym}|{tf}"
-                            if key in pair_results and pair_results[key]["best_strategy"] is not None:
-                                pr_result = pair_results[key]
-                                pr_tf = tf
-                                break
-                        if pr_result is None:
-                            continue
+                            if key not in pair_results or pair_results[key]["best_strategy"] is None:
+                                continue
 
-                        rr = research_results.get(sym, {})
-                        strategy = pr_result["best_strategy"]
-                        best_result = pr_result["best_result"]
-                        ind = pr_result["indicators"]
-                        ohlcv_df = pr_result["ohlcv"]
-                        entry_price = float(ohlcv_df["close"].iloc[-1])
-                        atr_14 = float(ind.get("atr_14", pd.Series([0])).iloc[-1])
-                        atr_50_val = float(ind.get("atr_50", pd.Series([0])).iloc[-1]) if "atr_50" in ind else 0.0
+                            pr_tf = pair_results[key]
+                            strategy = pr_tf["best_strategy"]
+                            best_result = pr_tf["best_result"]
+                            ind = pr_tf["indicators"]
+                            ohlcv_df = pr_tf["ohlcv"]
+                            entry_price = float(ohlcv_df["close"].iloc[-1])
+                            atr_14 = float(ind.get("atr_14", pd.Series([0])).iloc[-1])
+                            atr_50_val = float(ind.get("atr_50", pd.Series([0])).iloc[-1]) if "atr_50" in ind else 0.0
 
-                        try:
-                            sig = strategy.evaluate(ohlcv_df, ind)
-                        except Exception as e:
-                            logger.warning("%s strat eval failed: %s", sym, e)
-                            continue
-                        if sig.action == "HOLD":
-                            continue
+                            try:
+                                sig = strategy.evaluate(ohlcv_df, ind)
+                            except Exception as e:
+                                logger.warning("%s %s strat eval failed: %s", sym, tf, e)
+                                continue
+                            if sig.action == "HOLD":
+                                continue
 
-                        signal = generate_signal(
-                            symbol=sym, action=sig.action, entry_price=entry_price,
-                            atr_14=atr_14 if not pd.isna(atr_14) else 0.0,
-                            atr_50=atr_50_val if not pd.isna(atr_50_val) else 0.0,
-                            strategy_signal=sig, backtest_result=best_result,
-                            timeframe=pr_tf,
-                            sl_mult=config.atr_sl_multiplier, tp_mult=config.atr_tp_multiplier,
-                        )
-                        signal.sentiment_score = rr.get("sentiment_score")
-                        signal.onchain_signal = rr.get("onchain_signal")
-                        signal.macro_flag = rr.get("macro_flag", False)
-                        signal.research_metadata = json.dumps(rr) if rr else None
+                            signal = generate_signal(
+                                symbol=sym, action=sig.action, entry_price=entry_price,
+                                atr_14=atr_14 if not pd.isna(atr_14) else 0.0,
+                                atr_50=atr_50_val if not pd.isna(atr_50_val) else 0.0,
+                                strategy_signal=sig, backtest_result=best_result,
+                                timeframe=tf,
+                                sl_mult=config.atr_sl_multiplier, tp_mult=config.atr_tp_multiplier,
+                            )
+                            signal.sentiment_score = rr.get("sentiment_score")
+                            signal.onchain_signal = rr.get("onchain_signal")
+                            signal.macro_flag = rr.get("macro_flag", False)
+                            signal.research_metadata = json.dumps(rr) if rr else None
 
-                        # Apply research multiplier to technical confidence (Story 2.5 AC3)
-                        final_mult = rr.get("final_multiplier", 1.0)
-                        signal.confidence = round(max(0.0, min(1.0, signal.confidence * final_mult)), 4)
-                        if rr and not rr.get("research_unavailable", False):
-                            logger.debug("%s: confidence %.0f%% × research %.2f → %.0f%%",
-                                        sym, signal.confidence / final_mult * 100,
-                                        final_mult, signal.confidence * 100)
+                            # Apply research multiplier to technical confidence (Story 2.5 AC3)
+                            final_mult = rr.get("final_multiplier", 1.0)
+                            signal.confidence = round(max(0.0, min(1.0, signal.confidence * final_mult)), 4)
 
-                        signals_list.append(signal)
+                            signals_list.append(signal)
 
                     # Counter-metrics
                     metrics = compute_counter_metrics(signals_list)
@@ -543,6 +535,10 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # Suppress httpx/telegram logs that leak bot token in URLs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
     # Load .env first so all modules have access to env vars
     from src.config import _load_dotenv
     env_vars = _load_dotenv(Path(__file__).resolve().parent / ".env")
