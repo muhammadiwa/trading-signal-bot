@@ -15,8 +15,9 @@ import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
-# Ordered fallback chain: try each exchange in sequence
-_EXCHANGE_IDS = ["binance", "okx"]
+# Ordered fallback chain: OKX first (reliably accessible from most regions including ID),
+# then Binance (blocked in some regions but highest volume). CoinGecko is last-resort.
+_EXCHANGE_IDS = ["okx", "binance"]
 _MAX_RETRIES = 3
 _RETRY_DELAY_SECONDS = 2  # Base delay; exponential backoff: delay * 2^attempt
 

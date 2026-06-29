@@ -37,22 +37,32 @@ STAGES = [
 # Accumulated 7-day win rate — set by Stage 0, consumed by Stage 5
 _win_rate_7d_cache: Optional[float] = None
 
-CRITICAL_SOURCES = {"ccxt": "Exchange data (CCXT)", "telegram": "Telegram bot token"}
-NON_CRITICAL_SOURCES = {"alternative_me": "Fear & Greed Index (Alternative.me)"}
+CRITICAL_SOURCES = {"telegram": "Telegram bot token"}
+NON_CRITICAL_SOURCES = {"alternative_me": "Fear & Greed Index (Alternative.me)", "ccxt": "Exchange data (CCXT)"}
 
 
 def health_check(config: Settings) -> dict[str, bool]:
-    """Verify data sources are reachable before pipeline start."""
+    """Verify data sources are reachable before pipeline start.
+
+    CCXT: tries okx → binance → bybit, any success = pass.
+    This handles regional blocks (e.g. Binance blocked in some countries).
+    """
     results = {}
-    try:
-        import ccxt
-        exchange = ccxt.binance({"enableRateLimit": True, "timeout": 30000})
-        exchange.fetch_ticker("BTC/USDT")
-        exchange.close()
-        results["ccxt"] = True
-    except Exception as e:
-        logger.error("CCXT health check failed: %s", e)
+    for ex_id in ("okx", "binance", "bybit"):
+        try:
+            import ccxt
+            exchange = getattr(ccxt, ex_id)({"enableRateLimit": True, "timeout": 15000})
+            exchange.fetch_ticker("BTC/USDT")
+            exchange.close()
+            results["ccxt"] = True
+            break
+        except Exception:
+            try: exchange.close()
+            except Exception: pass
+            continue
+    if "ccxt" not in results:
         results["ccxt"] = False
+        logger.error("CCXT health check failed — all exchanges unreachable")
     try:
         import requests
         resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
