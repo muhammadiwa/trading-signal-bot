@@ -590,25 +590,17 @@ async def _run_bot(token: str) -> None:
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Register command suggestions (R1 fix)
+    # Initialize + register command suggestions BEFORE polling
+    await app.initialize()
     await _register_commands(app)
 
-    logger.info("Telegram bot started — polling for commands")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-    # Keep-alive: idle loop with periodic health check
-    while True:
-        await asyncio.sleep(60)
-        logger.debug("Bot heartbeat — alive")
+    logger.info("Telegram bot started — polling for commands (v22)")
+    # run_polling handles start + polling + idle internally
+    await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-def start_bot(token: str | None = None, chat_id: str | None = None) -> Application:
-    """Start the Telegram bot polling loop (sync wrapper for async core).
-
-    Returns the Application instance so the caller can manage lifecycle.
-    """
+def start_bot(token: str | None = None) -> Application:
+    """Start the Telegram bot polling loop (sync wrapper)."""
     if token is None:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -616,3 +608,4 @@ def start_bot(token: str | None = None, chat_id: str | None = None) -> Applicati
         raise ValueError("TELEGRAM_BOT_TOKEN not set")
 
     asyncio.run(_run_bot(token))
+    return None  # Never reached — run_polling blocks forever
