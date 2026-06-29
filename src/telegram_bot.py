@@ -4,7 +4,6 @@ Runs alongside the scheduler in a separate thread. All pipeline control
 and backtesting accessible from Telegram chat.
 """
 
-import asyncio
 import logging
 import os
 import time
@@ -558,12 +557,12 @@ async def _run_backtest(query, context, days: int) -> None:
 
 # ── Bot Runner ──────────────────────────────────────────────
 
-async def _register_commands(app: Application) -> None:
-    """Set bot commands that appear as suggestions when user types / in chat."""
+async def _post_init(app: Application) -> None:
+    """Set bot commands after initialization (runs before polling starts)."""
     commands = [
         BotCommand("start", "Menu utama dan daftar command"),
         BotCommand("run", "Jalankan pipeline manual"),
-        BotCommand("backtest", "Backtest interaktif (pair × TF × strategi × range)"),
+        BotCommand("backtest", "Backtest interaktif (pair x TF x strategi x range)"),
         BotCommand("signals", "Lihat sinyal hari ini / pending / semua"),
         BotCommand("status", "Status pipeline terakhir + win rate"),
         BotCommand("outcomes", "Statistik performa (7D / 30D / semua)"),
@@ -575,9 +574,9 @@ async def _register_commands(app: Application) -> None:
     logger.info("Bot commands registered — suggestions will appear in chat")
 
 
-async def _run_bot(token: str) -> None:
-    """Internal async runner for the bot."""
-    app = Application.builder().token(token).build()
+def build_app(token: str) -> Application:
+    """Build and configure the Telegram bot Application."""
+    app = Application.builder().token(token).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -590,22 +589,17 @@ async def _run_bot(token: str) -> None:
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Initialize + register command suggestions BEFORE polling
-    await app.initialize()
-    await _register_commands(app)
-
-    logger.info("Telegram bot started — polling for commands (v22)")
-    # run_polling handles start + polling + idle internally
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    return app
 
 
-def start_bot(token: str | None = None) -> Application:
-    """Start the Telegram bot polling loop (sync wrapper)."""
+def start_bot(token: str | None = None) -> None:
+    """Start the Telegram bot with long-polling (blocks until stopped)."""
     if token is None:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN not set — bot cannot start")
         raise ValueError("TELEGRAM_BOT_TOKEN not set")
 
-    asyncio.run(_run_bot(token))
-    return None  # Never reached — run_polling blocks forever
+    app = build_app(token)
+    logger.info("Telegram bot starting — polling for commands")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
