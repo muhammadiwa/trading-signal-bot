@@ -154,6 +154,20 @@ Signals include sentiment analysis, on-chain data, macro event warnings, and pre
 Signal accuracy improves over time through outcome tracking, LLM-generated reflections, and automatic weight adjustment via EMA.
 
 **FRs covered:** FR6.1-6.3 (3 FRs)
+
+### Epic 4: Interactive Telegram Bot
+Full interactive Telegram bot with command suggestions, inline keyboards, multi-timeframe signal generation, and on-demand backtesting. Bot runs 24/7 in parallel with cron scheduler — user can trigger pipeline, backtest any pair, view signals, and check performance from Telegram chat. Multi-timeframe (1h/4h/1d) signals generated independently per timeframe.
+
+**New FRs:** FR5.4-5.8, FR7.4 (5 FRs)
+
+**FRs in Epic 4:**
+FR5.4: Register bot commands via BotCommand API — suggestions appear when user types `/` in chat
+FR5.5: Interactive backtest wizard — user selects pair → timeframe → strategy → range via inline keyboard
+FR5.6: On-demand pipeline trigger — `/run` with confirmation dialog
+FR5.7: Signal viewer with filters (today/pending/all) + performance stats (7D/30D/all)
+FR5.8: Status dashboard — last run, pairs analyzed, signals generated, win rate
+FR7.4: CLI args for run modes — `--bot` (interactive), `--no-scheduler`, `--pipeline` (single run)
+
 ### Story 1.1: Project Setup
 
 As a developer,

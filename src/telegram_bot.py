@@ -12,7 +12,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import TelegramError
 
@@ -23,14 +23,21 @@ logger = logging.getLogger(__name__)
 
 # ── Helpers ────────────────────────────────────────────────
 
-async def _send_long_message(update: Update, text: str) -> None:
-    """Send a message, splitting if over Telegram's 4096 char limit."""
+async def _send_long_message(update_or_query, text: str) -> None:
+    """Send a message, splitting if over Telegram's 4096 char limit.
+    Works with both Update and CallbackQuery objects.
+    """
+    chat_obj = update_or_query.message if hasattr(update_or_query, "message") else update_or_query.callback_query.message
+    reply_fn = chat_obj.reply_text if hasattr(chat_obj, "reply_text") else update_or_query.edit_message_text
     if len(text) <= 4000:
-        await update.message.reply_text(text)
+        await reply_fn(text)
         return
     chunks = [text[i:i+3900] for i in range(0, len(text), 3900)]
     for i, chunk in enumerate(chunks):
-        await update.message.reply_text(chunk if i == 0 else f"(lanjutan...)\n{chunk}")
+        if i == 0:
+            await reply_fn(chunk)
+        else:
+            await reply_fn(f"(lanjutan...)\n{chunk}")
 
 
 def _check_auth(update: Update) -> bool:
@@ -47,16 +54,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_auth(update):
         return
     await update.message.reply_text(
-        "🤖 **Trading Signal Bot**\n\n"
-        "Gunakan command berikut:\n\n"
+        "🤖 **Trading Signal Bot v2**\n\n"
         "/run — Jalankan pipeline manual\n"
-        "/backtest — Backtest interaktif (pair × timeframe × strategi)\n"
+        "/backtest — Backtest interaktif (pair × timeframe × strategi × range)\n"
         "/signals — Lihat sinyal hari ini\n"
         "/status — Status pipeline terakhir\n"
         "/pairs — Daftar pair yang di-track\n"
-        "/profile <pair> — 4D profile detail (contoh: /profile BTC-USDT)\n"
+        "/profile — 4D profile detail (contoh: /profile BTC-USDT)\n"
         "/outcomes — Statistik performa historis\n"
-        "/help — Tampilkan menu ini",
+        "/help — Tampilkan menu ini\n\n"
+        "💡 Semua command bisa dipilih dari menu / di kolom chat.",
     )
 
 
@@ -551,21 +558,27 @@ async def _run_backtest(query, context, days: int) -> None:
 
 # ── Bot Runner ──────────────────────────────────────────────
 
-def start_bot(token: str | None = None, chat_id: str | None = None) -> Application:
-    """Start the Telegram bot polling loop.
+async def _register_commands(app: Application) -> None:
+    """Set bot commands that appear as suggestions when user types / in chat."""
+    commands = [
+        BotCommand("start", "Menu utama dan daftar command"),
+        BotCommand("run", "Jalankan pipeline manual"),
+        BotCommand("backtest", "Backtest interaktif (pair × TF × strategi × range)"),
+        BotCommand("signals", "Lihat sinyal hari ini / pending / semua"),
+        BotCommand("status", "Status pipeline terakhir + win rate"),
+        BotCommand("outcomes", "Statistik performa (7D / 30D / semua)"),
+        BotCommand("pairs", "Daftar pair yang di-track"),
+        BotCommand("profile", "4D profile detail — /profile BTC-USDT"),
+        BotCommand("help", "Tampilkan semua command"),
+    ]
+    await app.bot.set_my_commands(commands)
+    logger.info("Bot commands registered — suggestions will appear in chat")
 
-    Returns the Application instance so the caller can manage lifecycle.
-    Runs in the current thread (caller should put this in a thread).
-    """
-    if token is None:
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        logger.error("TELEGRAM_BOT_TOKEN not set — bot cannot start")
-        raise ValueError("TELEGRAM_BOT_TOKEN not set")
 
+async def _run_bot(token: str) -> None:
+    """Internal async runner for the bot."""
     app = Application.builder().token(token).build()
 
-    # Register commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("run", cmd_run))
@@ -577,6 +590,29 @@ def start_bot(token: str | None = None, chat_id: str | None = None) -> Applicati
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
+    # Register command suggestions (R1 fix)
+    await _register_commands(app)
+
     logger.info("Telegram bot started — polling for commands")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-    return app
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Keep-alive: idle loop with periodic health check
+    while True:
+        await asyncio.sleep(60)
+        logger.debug("Bot heartbeat — alive")
+
+
+def start_bot(token: str | None = None, chat_id: str | None = None) -> Application:
+    """Start the Telegram bot polling loop (sync wrapper for async core).
+
+    Returns the Application instance so the caller can manage lifecycle.
+    """
+    if token is None:
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not set — bot cannot start")
+        raise ValueError("TELEGRAM_BOT_TOKEN not set")
+
+    asyncio.run(_run_bot(token))
