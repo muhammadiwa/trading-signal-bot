@@ -609,6 +609,18 @@ def start_bot(token: str | None = None) -> None:
         logger.error("TELEGRAM_BOT_TOKEN not set — bot cannot start")
         raise ValueError("TELEGRAM_BOT_TOKEN not set")
 
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Log errors and continue — never crash on network issues."""
+        err = context.error
+        if isinstance(err, TelegramError) and "httpx.ConnectError" in str(err):
+            logger.warning("Telegram API temporarily unreachable — bot will retry automatically")
+        elif isinstance(err, TelegramError) and "Conflict" in str(err):
+            logger.error("Another bot instance is running! Terminate the other instance first.")
+            raise err
+        else:
+            logger.error("Bot handler error: %s", err, exc_info=err)
+
     app = build_app(token)
+    app.add_error_handler(error_handler)
     logger.info("Telegram bot starting — polling for commands")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -528,6 +528,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trading Signal Bot")
     parser.add_argument("--bot", action="store_true", help="Start interactive Telegram bot")
     parser.add_argument("--no-scheduler", action="store_true", help="Don't start cron scheduler")
+    parser.add_argument("--with-scheduler", action="store_true", help="Enable cron scheduler in bot mode")
     parser.add_argument("--pipeline", action="store_true", help="Run pipeline once and exit")
     args = parser.parse_args()
 
@@ -557,14 +558,15 @@ if __name__ == "__main__":
     elif args.pipeline:
         run_pipeline()
     elif args.bot:
-        import threading
         from src.telegram_bot import start_bot as start_tg_bot
 
-        if not args.no_scheduler:
+        # Only start scheduler if explicitly requested
+        if not args.no_scheduler and args.with_scheduler:
             sched = start_scheduler()
-            logger.info("Scheduler + Bot running in parallel")
+            logger.info("Scheduler + Bot running — pipeline will fire at cron time")
+        elif not args.no_scheduler:
+            logger.info("Bot mode — scheduler NOT started (use --with-scheduler to enable cron)")
         else:
             logger.info("Bot only mode (no scheduler)")
 
-        # Bot runs in main thread
         start_tg_bot()
