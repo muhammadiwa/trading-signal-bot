@@ -488,12 +488,24 @@ async def _run_backtest(query, context, days: int) -> None:
             VolatilityBreakout, VolumeDivergence, all_strategies,
         )
 
-        # Load data
+        # Load data — auto-fetch if cache doesn't exist yet
+        cache_path = f"data/ohlcv/{sym}-{tf}.parquet"
         try:
-            df = load_with_indicators(f"data/ohlcv/{sym}-{tf}.parquet")
+            df = load_with_indicators(cache_path)
         except Exception:
-            await query.message.edit_text(f"❌ Data {tf} tidak tersedia untuk {sym}. Jalankan pipeline dulu.")
-            return
+            await query.message.edit_text(f"⏳ Fetching {sym} [{tf}] data from exchange... (first time)")
+            try:
+                from src.exchange import fetch_ohlcv
+                from src.indicators import save_with_indicators
+                raw = fetch_ohlcv(sym, timeframe=tf, force_refresh=True)
+                save_with_indicators(raw, cache_path)
+                df = load_with_indicators(cache_path)
+            except Exception as e:
+                await query.message.edit_text(
+                    f"❌ Gagal fetch data {sym} [{tf}]: {str(e)[:100]}\n\n"
+                    f"Pastikan exchange API accessible dari server."
+                )
+                return
 
         # Trim to requested range
         if len(df) > days:
