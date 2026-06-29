@@ -39,18 +39,26 @@ async def _send_long_message(update_or_query, text: str) -> None:
             await reply_fn(f"(lanjutan...)\n{chunk}")
 
 
-def _check_auth(update: Update) -> bool:
-    """Restrict bot to configured chat_id only."""
+async def _check_auth(update: Update) -> bool:
+    """Restrict bot to configured chat_id only. Sends error if unauthorized."""
     allowed = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not allowed:
-        return True  # No restriction configured
-    return str(update.effective_chat.id) == allowed
+        return True  # No restriction configured — allow all
+    if str(update.effective_chat.id) != allowed:
+        logger.warning("Unauthorized access attempt from chat_id=%s (allowed=%s)",
+                       update.effective_chat.id, allowed)
+        await update.message.reply_text(
+            f"⛔ Akses ditolak. Chat ID kamu ({update.effective_chat.id}) "
+            f"tidak terdaftar di .env (TERDAFTAR: {allowed})."
+        )
+        return False
+    return True
 
 
 # ── Command: /start + /help ─────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
     await update.message.reply_text(
         "🤖 **Trading Signal Bot v2**\n\n"
@@ -73,7 +81,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Command: /run ───────────────────────────────────────────
 
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
 
     keyboard = [
@@ -89,9 +97,9 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def _do_run_pipeline(update: Update) -> None:
-    """Execute full pipeline and report results."""
-    msg = await update.callback_query.message.reply_text("⏳ Pipeline berjalan... (mungkin 1-5 menit)")
+async def _do_run_pipeline(query) -> None:
+    """Execute full pipeline and report results via callback query."""
+    chat_msg = await query.message.edit_text("⏳ Pipeline berjalan... (mungkin 1-5 menit)")
 
     try:
         from main import run_pipeline
@@ -110,15 +118,16 @@ async def _do_run_pipeline(update: Update) -> None:
             "",
             "Gunakan /signals untuk lihat sinyal.",
         ]
-        await msg.edit_text("\n".join(lines))
+        await chat_msg.edit_text("\n".join(lines))
     except Exception as e:
-        await msg.edit_text(f"❌ Pipeline gagal: {str(e)[:200]}")
+        logger.error("Pipeline /run failed: %s", e)
+        await chat_msg.edit_text(f"❌ Pipeline gagal: {str(e)[:200]}")
 
 
 # ── Command: /status ────────────────────────────────────────
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
 
     conn = get_connection()
@@ -171,7 +180,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Command: /signals ───────────────────────────────────────
 
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
 
     keyboard = [
@@ -226,7 +235,7 @@ async def _show_signals(update: Update, filter_mode: str) -> None:
 # ── Command: /outcomes ──────────────────────────────────────
 
 async def cmd_outcomes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
 
     keyboard = [
@@ -289,7 +298,7 @@ async def _show_outcomes(update: Update, days: Optional[int]) -> None:
 # ── Command: /pairs ─────────────────────────────────────────
 
 async def cmd_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
 
     from main import fetch_top_symbols
@@ -310,7 +319,7 @@ async def cmd_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Command: /profile ───────────────────────────────────────
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
 
     args = context.args
@@ -361,7 +370,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── Command: /backtest ──────────────────────────────────────
 
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _check_auth(update):
+    if not await _check_auth(update):
         return
 
     from main import fetch_top_symbols
